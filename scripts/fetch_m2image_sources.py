@@ -10,14 +10,17 @@ source bytes it actually publishes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location(
@@ -31,6 +34,7 @@ UBUNTU_CODENAMES = {
     "26.04": "resolute",
 }
 ROCKY_SOURCE_REPOS = ("BaseOS", "AppStream", "CRB")
+SHA512_RE = re.compile(r"^[0-9a-fA-F]{128}$")
 
 
 def run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
@@ -207,10 +211,108 @@ def _aports_recipe_path(repo: Path, commit: str, package: str) -> str:
     return matches[0].rsplit("/", 1)[0]
 
 
-def fetch_alpine(unit: dict, destination: Path, cache_dir: Path) -> None:
+def _literal_sha512sums(apkbuild: Path) -> dict[str, str]:
+    """Read the literal sha512sums block without executing an APKBUILD.
+
+    Alpine's archived distfiles are accepted only when the exact aports recipe
+    carries a literal SHA-512 for that filename.  Dynamic/unsupported checksum
+    syntax deliberately yields no fallback rather than weakening verification.
+    """
+
+    text = apkbuild.read_text(encoding="utf-8")
+    assignment = re.search(r"(?m)^[ \t]*sha512sums=([\"'])", text)
+    if assignment is None:
+        return {}
+    delimiter = assignment.group(1)
+    start = assignment.end()
+    end = text.find(delimiter, start)
+    if end < 0:
+        return {}
+
+    checksums: dict[str, str] = {}
+    for raw_line in text[start:end].splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split(None, 1)
+        if len(fields) != 2 or not SHA512_RE.fullmatch(fields[0]):
+            return {}
+        filename = fields[1].strip()
+        path = Path(filename)
+        if not filename or path.is_absolute() or ".." in path.parts:
+            return {}
+        checksums[filename] = fields[0].lower()
+    return checksums
+
+
+def _alpine_distfiles_branch(image: dict) -> str:
+    version = str(image.get("version") or "")
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)?", version)
+    if match is None:
+        raise ValueError(f"cannot derive Alpine distfiles branch from image version {version!r}")
+    return f"v{match.group(1)}.{match.group(2)}"
+
+
+def _recover_alpine_distfiles(recipe_root: Path, distfiles: Path, image: dict) -> list[str]:
+    """Recover missing, checksum-bound source files from Alpine's archive."""
+
+    checksums = _literal_sha512sums(recipe_root / "APKBUILD")
+    if not checksums:
+        return []
+
+    branch = _alpine_distfiles_branch(image)
+    recovered: list[str] = []
+    for filename, expected in sorted(checksums.items()):
+        # Local patches/configs exported with the exact aports recipe are not
+        # remote distfiles. Existing downloads also need no recovery.
+        if (recipe_root / filename).is_file() or (distfiles / filename).is_file():
+            continue
+        target = distfiles / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        encoded = quote(filename, safe="/._+-")
+        url = f"https://distfiles.alpinelinux.org/distfiles/{branch}/{encoded}"
+        if not fetch_url(url, target):
+            continue
+        digest = hashlib.sha512(target.read_bytes()).hexdigest()
+        if digest != expected:
+            target.unlink(missing_ok=True)
+            raise ValueError(
+                f"Alpine distfile checksum mismatch for {filename}: "
+                f"expected {expected}, got {digest}"
+            )
+        recovered.append(url)
+    return recovered
+
+
+def _alpine_abuild_fetch(work_root: Path, distfiles: Path) -> int:
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{work_root.resolve()}:/src",
+        "-v",
+        f"{distfiles.resolve()}:/dist",
+        "alpine:3.24",
+        "sh",
+        "-lc",
+        (
+            "set -eu; "
+            "trap 'chmod -R a+rwX /src /dist 2>/dev/null || true' EXIT; "
+            "apk add --no-cache alpine-sdk >/dev/null; "
+            "adduser -D builder; "
+            "chmod -R a+rwX /src /dist; "
+            "su builder -c 'cd /src && SRCDEST=/dist abuild fetch'"
+        ),
+    ]
+    return subprocess.run(command, check=False).returncode
+
+
+def fetch_alpine(unit: dict, image: dict, destination: Path, cache_dir: Path) -> None:
     require_tool("git")
     require_tool("tar")
     require_tool("docker")
+    require_tool("curl")
     source = unit["source"]
     package = str(source["sourcePackage"])
     commit = str(source["repositoryCommit"])
@@ -241,35 +343,28 @@ def fetch_alpine(unit: dict, destination: Path, cache_dir: Path) -> None:
     # abuild creates a local src/ work directory while fetching. Preserve the
     # exact git-archive recipe as immutable evidence and give abuild a disposable
     # writable copy so generated work files never contaminate the source bundle.
-    # Keep the mounted scratch world-writable before and after the builder run;
-    # otherwise container UID ownership can make TemporaryDirectory cleanup fail
-    # on the host even after abuild itself succeeds.
     with tempfile.TemporaryDirectory(prefix="firecrab-abuild-fetch-") as tmpdir:
         work_root = Path(tmpdir) / "recipe"
         shutil.copytree(recipe_root, work_root)
-        run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-v",
-                f"{work_root.resolve()}:/src",
-                "-v",
-                f"{distfiles.resolve()}:/dist",
-                "alpine:3.24",
-                "sh",
-                "-lc",
-                (
-                    "set -eu; "
-                    "apk add --no-cache alpine-sdk >/dev/null; "
-                    "adduser -D builder; "
-                    "chmod -R a+rwX /src /dist; "
-                    "su builder -c 'cd /src && SRCDEST=/dist abuild fetch'; "
-                    "chmod -R a+rwX /src /dist"
-                ),
-            ]
-        )
+        first_rc = _alpine_abuild_fetch(work_root, distfiles)
+        recovered: list[str] = []
+        if first_rc:
+            # Historical upstream URLs can disappear after Alpine has built the
+            # binary. Alpine's distfiles archive is the fail-closed recovery
+            # source: only exact files whose SHA-512 is frozen in this exact
+            # APKBUILD are admitted, then abuild verifies the completed set too.
+            recovered = _recover_alpine_distfiles(recipe_root, distfiles, image)
+            if not recovered:
+                raise subprocess.CalledProcessError(first_rc, "abuild fetch")
+            retry_rc = _alpine_abuild_fetch(work_root, distfiles)
+            if retry_rc:
+                raise subprocess.CalledProcessError(retry_rc, "abuild fetch after distfiles recovery")
+
     (destination / "APORTS_COMMIT.txt").write_text(commit + "\n", encoding="utf-8")
+    if recovered:
+        (destination / "FETCHED_FROM.txt").write_text(
+            "\n".join(recovered) + "\n", encoding="utf-8"
+        )
 
 
 def materialize(plan: dict, output_dir: Path, cache_dir: Path) -> dict:
@@ -300,7 +395,7 @@ def materialize(plan: dict, output_dir: Path, cache_dir: Path) -> dict:
         elif distribution == "ubuntu":
             fetch_ubuntu(unit, image, destination)
         elif distribution == "alpine":
-            fetch_alpine(unit, destination, cache_dir)
+            fetch_alpine(unit, image, destination, cache_dir)
         else:
             raise ValueError(f"unsupported source materializer distribution: {distribution!r}")
 
