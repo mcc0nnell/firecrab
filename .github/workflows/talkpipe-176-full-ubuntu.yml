@@ -34,7 +34,7 @@ jobs:
 
       - name: Materialize all exact Ubuntu source units with one apt index
         run: |
-          .github/validation/materialize-ubuntu-sources.py \
+          python3 .github/validation/materialize-ubuntu-sources.py \
             images/compliance/ubuntu-26.04-x86_64/source-publication-plan.json \
             full-ubuntu-source
 
