@@ -94,11 +94,12 @@ jobs:
             | tar -tf - \
             | grep -qx 'compliance/source-publication-plan.json'
 
-      - name: Materialize all exact Rocky source units in parallel
+      - name: Materialize all exact Rocky source units through release code
         run: |
-          python3 .github/validation/materialize-rocky-sources.py \
-            images/compliance/rocky-9.8-x86_64/source-publication-plan.json \
-            full-rocky-source
+          python3 scripts/fetch_m2image_sources.py \
+            --plan images/compliance/rocky-9.8-x86_64/source-publication-plan.json \
+            --output-dir full-rocky-source \
+            --workers 8
 
       - name: Package full corresponding-source archive
         env:
