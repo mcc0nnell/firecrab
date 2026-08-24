@@ -6,15 +6,17 @@ transport concerns separate from tool implementation.
 
 TalkPipe is the execution spine between MCP tools and the FireCrab REST API:
 
-    MCP tool -> typed request -> TalkPipe validation/call/normalization -> API
+    MCP tool -> typed request -> TalkPipe validation/policy/call/evidence -> API
 
-No tool accepts an arbitrary URL or API path.
+No tool accepts an arbitrary URL or API path. Destructive VM deletion is not
+exposed by this first slice, and mutating operations are disabled by default.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -24,7 +26,7 @@ import requests
 from mcp.server import MCPServer
 from talkpipe.pipe import core
 
-_ALLOWED_METHODS = frozenset({"GET", "POST", "DELETE"})
+_ALLOWED_METHODS = frozenset({"GET", "POST"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -48,6 +50,32 @@ class ApiResponse:
     status_code: int
     request_id: str | None
     data: Any
+
+
+@dataclass(frozen=True, slots=True)
+class ApiCall:
+    request: ApiRequest
+    response: ApiResponse
+    duration_ms: float
+
+
+@dataclass(frozen=True, slots=True)
+class FireCrabPolicy:
+    """Operator-controlled MCP capability policy.
+
+    Reads are always available. POST operations are hidden behind an explicit
+    opt-in so an MCP client cannot create/start/stop VMs merely because the
+    server process was launched. DELETE is intentionally absent from the tool
+    surface and rejected by request validation.
+    """
+
+    allow_mutations: bool = False
+
+    @classmethod
+    def from_env(cls) -> "FireCrabPolicy":
+        return cls(
+            allow_mutations=_env_flag("FIRECRAB_MCP_ALLOW_MUTATIONS"),
+        )
 
 
 RequestFn = Callable[..., requests.Response]
@@ -114,38 +142,78 @@ class ValidateRequest(core.AbstractSegment[ApiRequest, ApiRequest]):
             yield ApiRequest(method=method, path=item.path, body=item.body)
 
 
-class CallFireCrab(core.AbstractSegment[ApiRequest, ApiResponse]):
+class EnforcePolicy(core.AbstractSegment[ApiRequest, ApiRequest]):
+    """TalkPipe policy gate between MCP intent and FireCrab side effects."""
+
+    def __init__(self, policy: FireCrabPolicy) -> None:
+        super().__init__()
+        self.policy = policy
+
+    def transform(self, items: Iterable[ApiRequest]) -> Iterable[ApiRequest]:
+        for item in items:
+            if item.method != "GET" and not self.policy.allow_mutations:
+                raise FireCrabMcpError(
+                    "mutating FireCrab MCP tools are disabled; set "
+                    "FIRECRAB_MCP_ALLOW_MUTATIONS=1 to enable create/start/stop"
+                )
+            yield item
+
+
+class CallFireCrab(core.AbstractSegment[ApiRequest, ApiCall]):
     """TalkPipe segment that invokes the native FireCrab API."""
 
     def __init__(self, client: FireCrabClient) -> None:
         super().__init__()
         self.client = client
 
-    def transform(self, items: Iterable[ApiRequest]) -> Iterable[ApiResponse]:
+    def transform(self, items: Iterable[ApiRequest]) -> Iterable[ApiCall]:
         for item in items:
-            yield self.client.request(item)
+            started = time.perf_counter()
+            response = self.client.request(item)
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            yield ApiCall(
+                request=item,
+                response=response,
+                duration_ms=duration_ms,
+            )
 
 
-class NormalizeResult(core.AbstractSegment[ApiResponse, dict[str, Any]]):
-    """Return a stable MCP result envelope while preserving FireCrab payloads."""
+class NormalizeResult(core.AbstractSegment[ApiCall, dict[str, Any]]):
+    """Return a stable MCP evidence envelope while preserving FireCrab data."""
 
-    def transform(
-        self, items: Iterable[ApiResponse]
-    ) -> Iterable[dict[str, Any]]:
+    def transform(self, items: Iterable[ApiCall]) -> Iterable[dict[str, Any]]:
         for item in items:
+            risk = "read" if item.request.method == "GET" else "mutate"
             yield {
-                "statusCode": item.status_code,
-                "requestId": item.request_id,
-                "data": item.data,
+                "operation": {
+                    "method": item.request.method,
+                    "path": item.request.path,
+                    "risk": risk,
+                },
+                "statusCode": item.response.status_code,
+                "requestId": item.response.request_id,
+                "durationMs": round(item.duration_ms, 3),
+                "data": item.response.data,
             }
 
 
 class FireCrabExecutor:
     """Typed FireCrab operations executed through one TalkPipe pipeline."""
 
-    def __init__(self, client: FireCrabClient | None = None) -> None:
+    def __init__(
+        self,
+        client: FireCrabClient | None = None,
+        *,
+        policy: FireCrabPolicy | None = None,
+    ) -> None:
         self.client = client or FireCrabClient()
-        pipeline = ValidateRequest() | CallFireCrab(self.client) | NormalizeResult()
+        self.policy = policy or FireCrabPolicy.from_env()
+        pipeline = (
+            ValidateRequest()
+            | EnforcePolicy(self.policy)
+            | CallFireCrab(self.client)
+            | NormalizeResult()
+        )
         self._run = pipeline.as_function(single_in=True, single_out=True)
 
     def execute(
@@ -157,7 +225,16 @@ class FireCrabExecutor:
         return self._run(ApiRequest(method=method, path=path, body=body))
 
 
-mcp = MCPServer("FireCrab")
+mcp = MCPServer(
+    "FireCrab",
+    version="0.1.0",
+    instructions=(
+        "Explicit FireCrab management tools backed by the native API and "
+        "executed through TalkPipe. Reads are enabled by default. VM create, "
+        "start, and stop require FIRECRAB_MCP_ALLOW_MUTATIONS=1. Destructive "
+        "VM deletion is not exposed."
+    ),
+)
 
 
 @mcp.tool()
@@ -180,26 +257,20 @@ def getVM(vmId: str) -> dict[str, Any]:
 
 @mcp.tool()
 def createVM(spec: dict[str, Any]) -> dict[str, Any]:
-    """Create a FireCrab VM from the native FireCrab create payload."""
+    """Create a FireCrab VM. Requires the mutation policy opt-in."""
     return _executor.execute("POST", "/api/vms", spec)
 
 
 @mcp.tool()
 def startVM(vmId: str) -> dict[str, Any]:
-    """Start a FireCrab virtual machine."""
+    """Start a FireCrab virtual machine. Requires the mutation policy opt-in."""
     return _executor.execute("POST", f"/api/vms/{_id_segment(vmId)}/start")
 
 
 @mcp.tool()
 def stopVM(vmId: str) -> dict[str, Any]:
-    """Stop a FireCrab virtual machine."""
+    """Stop a FireCrab virtual machine. Requires the mutation policy opt-in."""
     return _executor.execute("POST", f"/api/vms/{_id_segment(vmId)}/stop")
-
-
-@mcp.tool()
-def deleteVM(vmId: str) -> dict[str, Any]:
-    """Delete a FireCrab virtual machine."""
-    return _executor.execute("DELETE", f"/api/vms/{_id_segment(vmId)}")
 
 
 @mcp.tool()
@@ -222,11 +293,19 @@ def _normalize_base_url(value: str) -> str:
         raise FireCrabMcpError(
             "FIRECRAB_API_URL must be an absolute http(s) URL"
         )
+    if parsed.username is not None or parsed.password is not None:
+        raise FireCrabMcpError(
+            "FIRECRAB_API_URL must not embed credentials"
+        )
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise FireCrabMcpError(
             "FIRECRAB_API_URL must not include a path, query, or fragment"
         )
     return value
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _decode_response(response: requests.Response) -> Any:
@@ -246,12 +325,6 @@ def _bounded_error_detail(value: Any, limit: int = 2048) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}…"
-
-
-# Construct the default executor only after all helpers used by FireCrabClient
-# exist. MCP tool functions resolve this global at invocation time, so tool
-# registration can remain close to the public interface above.
-_executor = FireCrabExecutor()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -292,6 +365,11 @@ def main() -> None:
         stateless_http=True,
         json_response=True,
     )
+
+
+# Environment-dependent executor creation stays after helper definitions so
+# invalid operator configuration fails with the intended FireCrabMcpError.
+_executor = FireCrabExecutor()
 
 
 if __name__ == "__main__":
