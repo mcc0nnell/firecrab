@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "firecrab-mcp"
+version = "0.1.0"
+description = "Jenkins-inspired MCP adapter for the FireCrab API, orchestrated with TalkPipe"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "mcp>=2,<3",
+    "requests>=2.33.0",
+    "talkpipe>=0.14.2,<0.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9,<10",
+]
+
+[project.scripts]
+firecrab-mcp = "firecrab_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/firecrab_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
