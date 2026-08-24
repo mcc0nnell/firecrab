@@ -1,0 +1,85 @@
+name: TalkPipe #176 source publication
+
+on:
+  pull_request:
+    branches: [fix/host-license-artifacts-176]
+
+permissions:
+  contents: read
+
+jobs:
+  adversary:
+    name: TalkPipe source-publication adversary
+    if: github.event.pull_request.head.ref == 'validation/176-corresponding-source-publication'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: validation/176-corresponding-source-publication
+
+      - name: Unit tests
+        run: python3 -m unittest scripts/test_m2image_source_publication.py
+
+      - name: TalkPipe in python:3.12-slim
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            python:3.12-slim \
+            bash -lc '
+              set -euo pipefail
+              apt-get update >/dev/null
+              apt-get install -y --no-install-recommends git ca-certificates >/dev/null
+              git clone -q https://github.com/sandialabs/talkpipe.git /tmp/talkpipe
+              git -C /tmp/talkpipe checkout -q 0ceb36bc1ab31df227c52a5eab990b61abd050bc
+              test "$(git -C /tmp/talkpipe rev-parse HEAD)" = 0ceb36bc1ab31df227c52a5eab990b61abd050bc
+              pip install --no-cache-dir -q "pydantic>=2.4.0" "numpy>=1.22.2" greenlet
+              PYTHONPATH=/tmp/talkpipe/src python3 .github/validation/talkpipe-176-sources.py
+            '
+
+  real-source-plan:
+    name: Real source plan (${{ matrix.alias }})
+    if: github.event.pull_request.head.ref == 'validation/176-corresponding-source-publication'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        alias: [alpine-3.24.1, ubuntu-26.04, rocky-9.8]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: validation/176-corresponding-source-publication
+
+      - name: Install real-image build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs file gzip tar curl zstd xz-utils jq
+
+      - name: Build real M2Image
+        env:
+          ZSTD_LEVEL: '1'
+          ZSTD_THREADS: '2'
+        run: scripts/build-m2images.sh --alias "${{ matrix.alias }}" --arch x86_64
+
+      - name: Require complete source-publication plan
+        run: |
+          set -euo pipefail
+          root="images/compliance/${{ matrix.alias }}-x86_64"
+          python3 scripts/m2image_source_publication.py plan \
+            --source-map "$root/source-map.json" \
+            --output "$root/source-publication-plan.json"
+          python3 - "$root/source-publication-plan.json" <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1], encoding='utf-8'))
+          assert plan['coveragePolicy'] == 'all-installed-packages'
+          assert plan['packageCount'] > 0
+          assert plan['sourceCount'] > 0
+          covered = sum(len(item['binaryPackages']) for item in plan['sources'])
+          assert covered == plan['packageCount'], (covered, plan['packageCount'])
+          print(
+              'source plan:',
+              plan['image']['distribution'],
+              f"packages={plan['packageCount']}",
+              f"sources={plan['sourceCount']}",
+          )
+          PY
