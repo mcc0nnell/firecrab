@@ -1,0 +1,77 @@
+name: TalkPipe #176 full Ubuntu sources
+
+on:
+  pull_request:
+    branches: [fix/host-license-artifacts-176]
+
+permissions:
+  contents: read
+
+jobs:
+  full-ubuntu-source-archive:
+    name: Full source archive (ubuntu-26.04)
+    if: github.event.pull_request.head.ref == 'validation/176-corresponding-source-publication'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: validation/176-corresponding-source-publication
+
+      - name: Install real-image/source tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs file gzip tar curl zstd xz-utils jq dpkg-dev
+
+      - name: Source fetch regression tests
+        run: python3 -m unittest scripts/test_fetch_m2image_sources.py
+
+      - name: Build Ubuntu M2Image and frozen source plan
+        env:
+          ZSTD_LEVEL: '1'
+          ZSTD_THREADS: '2'
+        run: scripts/build-m2images.sh --alias ubuntu-26.04 --arch x86_64
+
+      - name: Materialize all exact Ubuntu source units with one apt index
+        run: |
+          .github/validation/materialize-ubuntu-sources.py \
+            images/compliance/ubuntu-26.04-x86_64/source-publication-plan.json \
+            full-ubuntu-source
+
+      - name: Package full corresponding-source archive
+        env:
+          ZSTD_LEVEL: '1'
+          ZSTD_THREADS: '2'
+        run: |
+          scripts/package-m2image-sources.sh \
+            --alias ubuntu-26.04 --arch x86_64 \
+            --materialized-dir full-ubuntu-source
+
+      - name: Verify complete exact-source archive
+        run: |
+          set -euo pipefail
+          archive=dist/m2images/x86_64/ubuntu-26.04.sources.tar.zst
+          verify=$(mktemp -d)
+          trap 'rm -rf "$verify"' EXIT
+          zstd -dc "$archive" | tar -x -C "$verify" \
+            source-publication-plan.json source-index.json
+          python3 - "$verify/source-publication-plan.json" "$verify/source-index.json" <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1], encoding='utf-8'))
+          index = json.load(open(sys.argv[2], encoding='utf-8'))
+          assert index['coveragePolicy'] == 'all-installed-packages'
+          assert index['packageCount'] == plan['packageCount']
+          assert index['sourceBackedPackageCount'] == plan['sourceBackedPackageCount']
+          assert index['nonSourcePackageCount'] == plan['nonSourcePackageCount']
+          assert index['sourceCount'] == plan['sourceCount']
+          assert index['fileCount'] >= index['sourceCount'] > 0
+          assert all(item['files'] for item in index['sources'])
+          print(
+              'full Ubuntu exact-source archive:',
+              f"packages={index['packageCount']}",
+              f"sources={index['sourceCount']}",
+              f"files={index['fileCount']}",
+          )
+          PY
+          stat -c 'source archive bytes=%s' "$archive"
+          (cd dist/m2images/x86_64 && sha256sum -c SHA256SUMS)
