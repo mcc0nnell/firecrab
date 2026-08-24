@@ -7,7 +7,7 @@ on:
       - '.github/workflows/firecrab-mcp.yml'
   push:
     branches:
-      - feat/talkpipe-firecrab-mcp
+      - 'feat/**'
     paths:
       - 'firecrab-mcp/**'
       - '.github/workflows/firecrab-mcp.yml'
