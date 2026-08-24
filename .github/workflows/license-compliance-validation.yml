@@ -1,0 +1,118 @@
+name: License compliance validation
+
+on:
+  pull_request:
+
+jobs:
+  real-inventory:
+    name: Real release inventory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: firecrab-frontend/package-lock.json
+
+      - name: Fetch Cargo dependency sources
+        run: cargo fetch --locked
+
+      - name: Install frontend runtime dependencies
+        run: npm ci --omit=dev
+        working-directory: firecrab-frontend
+
+      - name: Unit tests
+        run: python3 -m unittest scripts/test_release_compliance.py
+
+      - name: Generate and gate the real inventory
+        run: |
+          set -o pipefail
+          cargo metadata --format-version=1 --locked > cargo-metadata.json
+          python3 scripts/release_compliance.py \
+            --cargo-metadata cargo-metadata.json \
+            --frontend-lock firecrab-frontend/package-lock.json \
+            --frontend-root firecrab-frontend \
+            --notices-out dist/compliance/THIRD_PARTY_NOTICES.txt \
+            --inventory-out dist/compliance/release-license-inventory.json \
+            --deny-incompatible
+          python3 - <<'PY'
+          import json
+          data = json.load(open('dist/compliance/release-license-inventory.json'))
+          print(f"runtime={len(data['runtime'])} build_test_only={len(data['buildTestOnly'])}")
+          for item in data['runtime']:
+              print(f"runtime {item['ecosystem']} {item['name']} {item['version']} {item['license']}")
+          PY
+
+      - name: Upload generated compliance artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-compliance-validation
+          path: dist/compliance
+          if-no-files-found: ignore
+
+  talkpipe-policy:
+    name: TalkPipe policy adversary
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    steps:
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@v7
+
+      - name: Fetch pinned Sandia TalkPipe
+        run: |
+          git clone --filter=blob:none https://github.com/sandialabs/talkpipe.git /tmp/talkpipe
+          git -C /tmp/talkpipe checkout 0ceb36bc1ab31df227c52a5eab990b61abd050bc
+          test "$(git -C /tmp/talkpipe rev-parse HEAD)" = 0ceb36bc1ab31df227c52a5eab990b61abd050bc
+
+      - name: Install Pipe API dependencies
+        run: pip install --no-cache-dir 'pydantic>=2.4.0' 'numpy>=1.22.2' greenlet
+
+      - name: Exercise license policy through TalkPipe
+        run: |
+          python - <<'PY'
+          import sys
+          import types
+          from pathlib import Path
+
+          pkg = types.ModuleType("talkpipe")
+          pkg.__path__ = ["/tmp/talkpipe/src/talkpipe"]
+          sys.modules["talkpipe"] = pkg
+          from talkpipe.pipe.core import segment, source
+
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          import release_compliance as compliance
+
+          cases = [
+              ("apache", "Apache-2.0", True),
+              ("gpl-only", "GPL-2.0-only", False),
+              ("agpl-only", "AGPL-3.0-only", False),
+              ("dual", "MIT OR GPL-2.0-only", True),
+              ("lgpl", "LGPL-2.1-only", True),
+              ("missing", None, False),
+          ]
+
+          @source()
+          def scenarios():
+              yield from cases
+
+          @segment()
+          def evaluate(items):
+              for name, expression, expected in items:
+                  yield name, expected, compliance.license_allowed(expression)
+
+          results = list((scenarios() | evaluate())())
+          for name, expected, got in results:
+              print(f"{name}: expected={expected} got={got}")
+          assert all(expected == got for _, expected, got in results), results
+          print(f"TalkPipe license-policy validation passed: {len(results)} scenarios")
+          PY
