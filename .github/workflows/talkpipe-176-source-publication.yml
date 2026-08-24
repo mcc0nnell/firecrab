@@ -42,7 +42,7 @@ jobs:
             '
 
   real-source-plan:
-    name: Real source plan (${{ matrix.alias }})
+    name: Real source (${{ matrix.alias }})
     if: github.event.pull_request.head.ref == 'validation/176-corresponding-source-publication'
     runs-on: ubuntu-latest
     strategy:
@@ -54,10 +54,10 @@ jobs:
         with:
           ref: validation/176-corresponding-source-publication
 
-      - name: Install real-image build tools
+      - name: Install real-image/source tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs file gzip tar curl zstd xz-utils jq
+          sudo apt-get install -y e2fsprogs file gzip tar curl zstd xz-utils jq dpkg-dev
 
       - name: Build real M2Image
         env:
@@ -92,5 +92,62 @@ jobs:
               f"source_backed={source_backed}",
               f"non_source={non_source}",
               f"sources={plan['sourceCount']}",
+          )
+          PY
+
+      - name: Select representative exact source
+        run: |
+          root="images/compliance/${{ matrix.alias }}-x86_64"
+          python3 - "$root/source-publication-plan.json" representative-plan.json <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1], encoding='utf-8'))
+          distro = plan['image']['distribution']
+          if distro == 'alpine':
+              predicate = lambda unit: unit['source'].get('sourcePackage') == 'busybox'
+          elif distro == 'ubuntu':
+              predicate = lambda unit: unit['source'].get('sourcePackage', '').startswith('linux')
+          elif distro == 'rocky':
+              predicate = lambda unit: unit['source'].get('sourceArtifact', '').startswith('kernel-')
+          else:
+              raise SystemExit(f'unsupported representative distro: {distro}')
+          unit = next((item for item in plan['sources'] if predicate(item)), None)
+          if unit is None:
+              raise SystemExit(f'no representative source unit found for {distro}')
+          count = len(unit['binaryPackages'])
+          reduced = {
+              'schemaVersion': 1,
+              'coveragePolicy': 'all-installed-packages',
+              'image': plan['image'],
+              'packageCount': count,
+              'sourceBackedPackageCount': count,
+              'nonSourcePackageCount': 0,
+              'sourceCount': 1,
+              'sources': [unit],
+              'nonSourcePackages': [],
+          }
+          json.dump(reduced, open(sys.argv[2], 'w', encoding='utf-8'), indent=2, sort_keys=True)
+          print('representative source:', distro, unit['source'])
+          PY
+
+      - name: Fetch and hash representative matching source
+        run: |
+          python3 scripts/fetch_m2image_sources.py \
+            --plan representative-plan.json \
+            --output-dir representative-source
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          index = json.loads(Path('representative-source/source-index.json').read_text())
+          plan = json.loads(Path('representative-source/source-publication-plan.json').read_text())
+          assert index['packageCount'] == plan['packageCount']
+          assert index['sourceCount'] == 1
+          assert index['fileCount'] > 0
+          assert index['sources'][0]['source'] == plan['sources'][0]['source']
+          assert all(len(item['sha256']) == 64 for item in index['sources'][0]['files'])
+          print(
+              'matching source verified:',
+              index['image']['distribution'],
+              f"files={index['fileCount']}",
+              f"packages={index['packageCount']}",
           )
           PY
