@@ -24,6 +24,22 @@ jobs:
             scripts/test_m2image_compliance.py \
             scripts/test_m2image_source_publication.py
 
+      - name: Source archive and publisher contracts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs zstd shellcheck
+          shellcheck \
+            scripts/collect-m2image-compliance.sh \
+            scripts/package-m2images.sh \
+            scripts/package-m2image-sources.sh \
+            scripts/publish-m2images-r2.sh \
+            scripts/test-m2image-package-compliance.sh \
+            scripts/test-m2image-source-package.sh \
+            scripts/test-m2image-source-publish.sh
+          bash scripts/test-m2image-package-compliance.sh
+          bash scripts/test-m2image-source-package.sh
+          bash scripts/test-m2image-source-publish.sh
+
       - name: TalkPipe in python:3.12-slim
         run: |
           docker run --rm \
@@ -64,6 +80,12 @@ jobs:
           ZSTD_LEVEL: '1'
           ZSTD_THREADS: '2'
         run: scripts/build-m2images.sh --alias "${{ matrix.alias }}" --arch x86_64
+
+      - name: Require frozen plan inside binary archive
+        run: |
+          zstd -dc "dist/m2images/x86_64/${{ matrix.alias }}.tar.zst" \
+            | tar -tf - \
+            | grep -qx 'compliance/source-publication-plan.json'
 
       - name: Require complete source-publication plan
         run: |
