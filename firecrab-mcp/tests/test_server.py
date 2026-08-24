@@ -169,9 +169,20 @@ def test_mcp_surface_publishes_jenkins_style_safety_annotations() -> None:
         "startVM",
         "stopVM",
         "getVMLog",
+        "triggerBuild",
+        "getBuild",
+        "getBuildLog",
+        "stopBuild",
     }
 
-    for name in {"getStatus", "listVMs", "getVM", "getVMLog"}:
+    for name in {
+        "getStatus",
+        "listVMs",
+        "getVM",
+        "getVMLog",
+        "getBuild",
+        "getBuildLog",
+    }:
         annotations = tools[name].annotations
         assert annotations is not None
         assert annotations.read_only_hint is True
@@ -179,9 +190,15 @@ def test_mcp_surface_publishes_jenkins_style_safety_annotations() -> None:
         assert annotations.idempotent_hint is True
         assert tools[name].output_schema is not None
 
-    for name in {"createVM", "startVM", "stopVM"}:
+    for name in {"createVM", "startVM", "stopVM", "triggerBuild"}:
         annotations = tools[name].annotations
         assert annotations is not None
         assert annotations.read_only_hint is False
         assert annotations.destructive_hint is False
         assert tools[name].output_schema is not None
+
+    stop_annotations = tools["stopBuild"].annotations
+    assert stop_annotations is not None
+    assert stop_annotations.read_only_hint is False
+    assert stop_annotations.destructive_hint is True
+    assert tools["stopBuild"].output_schema is not None
