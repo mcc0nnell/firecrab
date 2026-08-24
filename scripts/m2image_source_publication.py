@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 ALPINE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+RPM_KEY_METADATA_DISPOSITION = "rpm-key-metadata"
 
 
 def _read_json(path: Path) -> dict:
@@ -89,6 +90,29 @@ def _normalized_source(distribution: str, source: dict) -> dict:
     raise ValueError(f"unsupported M2Image distribution for source publication: {distribution!r}")
 
 
+def _non_source_record(distribution: str, package: dict) -> dict | None:
+    disposition = str(package.get("sourceDisposition") or "")
+    if not disposition:
+        return None
+    binary = str(package.get("binaryPackage") or "")
+    if (
+        distribution.lower() != "rocky"
+        or binary != "gpg-pubkey"
+        or disposition != RPM_KEY_METADATA_DISPOSITION
+    ):
+        raise ValueError(
+            f"{binary or '<unknown>'}: unsupported non-source disposition {disposition!r}"
+        )
+    return {
+        "name": binary,
+        "version": str(package.get("binaryVersion") or ""),
+        "architecture": str(package.get("architecture") or ""),
+        "declaredLicense": package.get("declaredLicense"),
+        "sourceDisposition": disposition,
+        "reason": "RPM imported public-key metadata has no SOURCERPM payload",
+    }
+
+
 def publication_plan(source_map: dict) -> dict:
     if source_map.get("schemaVersion") != 1:
         raise ValueError("source map schemaVersion must be 1")
@@ -102,6 +126,7 @@ def publication_plan(source_map: dict) -> dict:
         raise ValueError("source map image is missing distribution")
 
     grouped: dict[str, dict] = {}
+    non_source_packages: list[dict] = []
     seen_binaries: set[tuple[str, str, str]] = set()
     for package in packages:
         if not isinstance(package, dict):
@@ -115,6 +140,13 @@ def publication_plan(source_map: dict) -> dict:
         if binary_key in seen_binaries:
             raise ValueError(f"duplicate binary package in source map: {binary}@{version}/{architecture}")
         seen_binaries.add(binary_key)
+
+        non_source = _non_source_record(distribution, package)
+        if non_source is not None:
+            if package.get("source") is not None:
+                raise ValueError(f"{binary}@{version}: non-source package must not carry a source resolver")
+            non_source_packages.append(non_source)
+            continue
 
         raw_source = package.get("source")
         if not isinstance(raw_source, dict):
@@ -146,14 +178,24 @@ def publication_plan(source_map: dict) -> dict:
             key=lambda item: (item["name"], item["version"], item["architecture"])
         )
         sources.append(unit)
+    non_source_packages.sort(
+        key=lambda item: (item["name"], item["version"], item["architecture"])
+    )
+
+    source_backed_count = sum(len(item["binaryPackages"]) for item in sources)
+    if source_backed_count + len(non_source_packages) != len(packages):
+        raise ValueError("source publication plan does not account for every installed package")
 
     return {
         "schemaVersion": 1,
         "coveragePolicy": "all-installed-packages",
         "image": image,
         "packageCount": len(packages),
+        "sourceBackedPackageCount": source_backed_count,
+        "nonSourcePackageCount": len(non_source_packages),
         "sourceCount": len(sources),
         "sources": sources,
+        "nonSourcePackages": non_source_packages,
     }
 
 
@@ -161,8 +203,9 @@ def source_index(plan: dict, source_root: Path) -> dict:
     if plan.get("schemaVersion") != 1 or plan.get("coveragePolicy") != "all-installed-packages":
         raise ValueError("source publication plan is not a supported schema/policy")
     sources = plan.get("sources")
-    if not isinstance(sources, list) or not sources:
-        raise ValueError("source publication plan contains no source units")
+    non_source_packages = plan.get("nonSourcePackages", [])
+    if not isinstance(sources, list) or not isinstance(non_source_packages, list):
+        raise ValueError("source publication plan has malformed source coverage sections")
 
     indexed = []
     binary_coverage = 0
@@ -199,10 +242,11 @@ def source_index(plan: dict, source_root: Path) -> dict:
             }
         )
 
+    binary_coverage += len(non_source_packages)
     expected_packages = int(plan.get("packageCount") or 0)
     if binary_coverage != expected_packages:
         raise ValueError(
-            f"source bundle covers {binary_coverage} binaries but plan requires {expected_packages}"
+            f"source bundle accounts for {binary_coverage} binaries but plan requires {expected_packages}"
         )
 
     return {
@@ -210,9 +254,12 @@ def source_index(plan: dict, source_root: Path) -> dict:
         "coveragePolicy": plan["coveragePolicy"],
         "image": plan.get("image"),
         "packageCount": expected_packages,
+        "sourceBackedPackageCount": expected_packages - len(non_source_packages),
+        "nonSourcePackageCount": len(non_source_packages),
         "sourceCount": len(indexed),
         "fileCount": sum(len(item["files"]) for item in indexed),
         "sources": indexed,
+        "nonSourcePackages": non_source_packages,
     }
 
 
@@ -243,7 +290,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         "m2image source publication: "
-        f"packages={document['packageCount']} sources={document['sourceCount']} -> {args.output}"
+        f"packages={document['packageCount']} sources={document['sourceCount']} "
+        f"non_source={document.get('nonSourcePackageCount', 0)} -> {args.output}"
     )
     return 0
 
