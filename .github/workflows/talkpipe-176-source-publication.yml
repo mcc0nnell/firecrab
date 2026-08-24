@@ -173,3 +173,58 @@ jobs:
               f"packages={index['packageCount']}",
           )
           PY
+
+  full-alpine-source-archive:
+    name: Full source archive (alpine-3.24.1)
+    if: github.event.pull_request.head.ref == 'validation/176-corresponding-source-publication'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: validation/176-corresponding-source-publication
+
+      - name: Install real-image/source tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs file gzip tar curl zstd xz-utils jq dpkg-dev
+
+      - name: Build Alpine M2Image and frozen source plan
+        env:
+          ZSTD_LEVEL: '1'
+          ZSTD_THREADS: '2'
+        run: scripts/build-m2images.sh --alias alpine-3.24.1 --arch x86_64
+
+      - name: Materialize every installed package source and package it
+        env:
+          ZSTD_LEVEL: '1'
+          ZSTD_THREADS: '2'
+        run: |
+          scripts/package-m2image-sources.sh --alias alpine-3.24.1 --arch x86_64
+
+      - name: Verify complete exact-source archive
+        run: |
+          set -euo pipefail
+          archive=dist/m2images/x86_64/alpine-3.24.1.sources.tar.zst
+          verify=$(mktemp -d)
+          trap 'rm -rf "$verify"' EXIT
+          zstd -dc "$archive" | tar -x -C "$verify" \
+            source-publication-plan.json source-index.json
+          python3 - "$verify/source-publication-plan.json" "$verify/source-index.json" <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1], encoding='utf-8'))
+          index = json.load(open(sys.argv[2], encoding='utf-8'))
+          assert index['coveragePolicy'] == 'all-installed-packages'
+          assert index['packageCount'] == plan['packageCount']
+          assert index['sourceBackedPackageCount'] == plan['sourceBackedPackageCount']
+          assert index['nonSourcePackageCount'] == plan['nonSourcePackageCount']
+          assert index['sourceCount'] == plan['sourceCount']
+          assert index['fileCount'] >= index['sourceCount'] > 0
+          assert all(item['files'] for item in index['sources'])
+          print(
+              'full exact-source archive:',
+              f"packages={index['packageCount']}",
+              f"sources={index['sourceCount']}",
+              f"files={index['fileCount']}",
+          )
+          PY
+          (cd dist/m2images/x86_64 && sha256sum -c SHA256SUMS)
