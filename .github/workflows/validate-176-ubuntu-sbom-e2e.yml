@@ -1,0 +1,44 @@
+name: Validate 176 Ubuntu M2Image SBOM end to end
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  ubuntu-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install host image-build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs file gzip tar curl zstd xz-utils
+
+      - name: Build Ubuntu M2Image with real package DB SBOM
+        run: |
+          mkdir -p images/compliance
+          sudo env \
+            M2IMAGE_ARCH=x86_64 \
+            M2IMAGE_DISTRO_SERIES=26.04 \
+            M2IMAGE_ALIAS=ubuntu-26.04 \
+            M2IMAGE_SBOM_OUTPUT="$PWD/images/compliance/ubuntu-26.04-x86_64.spdx.json" \
+            scripts/firecracker-menual/install-ubuntu-roofs.sh
+          sudo chown -R "$USER:$USER" images build || true
+
+      - name: Verify real dpkg and kernel provenance
+        run: |
+          python3 - images/compliance/ubuntu-26.04-x86_64.spdx.json <<'PY'
+          import json, sys
+          doc = json.load(open(sys.argv[1], encoding='utf-8'))
+          assert doc['spdxVersion'] == 'SPDX-2.3'
+          packages = doc['packages'][1:]
+          assert len(packages) >= 25, len(packages)
+          kernels = [p for p in packages if p['name'].startswith('linux-image-')]
+          assert kernels, 'no installed linux-image package in SBOM'
+          kernel = kernels[-1]
+          assert kernel['versionInfo'] and kernel['versionInfo'] != 'NOASSERTION'
+          annotations = ' '.join(a['comment'] for a in doc.get('annotations', []))
+          assert f"{kernel['name']}@{kernel['versionInfo']}" in annotations
+          print(f"real Ubuntu SBOM: {len(packages)} packages, {kernel['name']}={kernel['versionInfo']}")
+          PY
