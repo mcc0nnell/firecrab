@@ -32,12 +32,14 @@ V:1.37.0-r18
 A:x86_64
 L:GPL-2.0-only
 o:busybox
+c:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 P:linux-virt
 V:6.15.4-r0
 A:x86_64
 L:GPL-2.0-only
 o:linux-lts
+c:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 EOF_APK
 SOURCE_DATE_EPOCH=0 python3 "$root/scripts/m2image_sbom.py" \
   --format alpine --distribution alpine --image-alias "$alias" \
