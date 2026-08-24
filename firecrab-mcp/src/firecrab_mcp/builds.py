@@ -221,7 +221,15 @@ class FireCrabBuildExecutor:
         result = self.executor.execute("GET", f"/api/vms/{build_id}")
         vm = _mapping_data(result, "get build VM")
         name = vm.get("name")
-        if not isinstance(name, str) or not name.startswith(_BUILD_PREFIX):
+        refs = vm.get("shellRefs")
+        owns_matching_shell = isinstance(refs, list) and any(
+            isinstance(ref, dict) and ref.get("name") == name for ref in refs
+        )
+        if (
+            not isinstance(name, str)
+            or not name.startswith(_BUILD_PREFIX)
+            or not owns_matching_shell
+        ):
             raise FireCrabBuildError(
                 f"VM {build_id} is not an MCP build VM; refusing build operation"
             )
