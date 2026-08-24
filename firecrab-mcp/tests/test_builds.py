@@ -55,6 +55,22 @@ def envelope(data: dict[str, Any], request_id: str) -> dict[str, Any]:
     }
 
 
+def build_vm(*, name: str = "ci-unit-abcdef", state: str = "running") -> dict[str, Any]:
+    return {
+        "id": BUILD_ID,
+        "name": name,
+        "state": state,
+        "shellRefs": [
+            {
+                "shellId": SHELL_ID,
+                "revisionId": "44444444-4444-4444-8444-444444444444",
+                "version": 1,
+                "name": name,
+            }
+        ],
+    }
+
+
 def test_profile_requires_operator_owned_template_and_network() -> None:
     executor = FakeExecutor([])
     builds = FireCrabBuildExecutor(
@@ -158,7 +174,7 @@ def test_parse_build_console_partial_is_not_complete() -> None:
 def test_get_build_maps_firecrab_console_to_completed_build() -> None:
     executor = FakeExecutor(
         [
-            envelope({"id": BUILD_ID, "name": "ci-unit-abcdef", "state": "running"}, "req-vm"),
+            envelope(build_vm(), "req-vm"),
             envelope(
                 {
                     "consoleLog": (
@@ -187,7 +203,7 @@ def test_get_build_maps_firecrab_console_to_completed_build() -> None:
 def test_get_build_log_returns_command_output_only() -> None:
     executor = FakeExecutor(
         [
-            envelope({"id": BUILD_ID, "name": "ci-unit-abcdef", "state": "running"}, "req-vm"),
+            envelope(build_vm(), "req-vm"),
             envelope(
                 {
                     "consoleLog": (
@@ -216,6 +232,25 @@ def test_stop_build_refuses_unowned_vm_before_mutating() -> None:
     executor = FakeExecutor(
         [envelope({"id": BUILD_ID, "name": "database", "state": "running"}, "req-vm")]
     )
+    builds = FireCrabBuildExecutor(executor, profile=profile())
+
+    with pytest.raises(FireCrabBuildError, match="not an MCP build VM"):
+        builds.stop_build(BUILD_ID)
+
+    assert executor.calls == [("GET", f"/api/vms/{BUILD_ID}", None)]
+
+
+def test_stop_build_requires_matching_pinned_shell_provenance() -> None:
+    vm = build_vm()
+    vm["shellRefs"] = [
+        {
+            "shellId": SHELL_ID,
+            "revisionId": "44444444-4444-4444-8444-444444444444",
+            "version": 1,
+            "name": "different-shell",
+        }
+    ]
+    executor = FakeExecutor([envelope(vm, "req-vm")])
     builds = FireCrabBuildExecutor(executor, profile=profile())
 
     with pytest.raises(FireCrabBuildError, match="not an MCP build VM"):
