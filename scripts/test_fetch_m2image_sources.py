@@ -132,5 +132,102 @@ class AlpineDistfilesRecoveryTests(unittest.TestCase):
             mocked.assert_not_called()
 
 
+class BatchedSourceFetchTests(unittest.TestCase):
+    def test_ubuntu_full_fetch_refreshes_source_index_once(self):
+        units = [
+            {
+                "sourceId": "one",
+                "source": {
+                    "type": "ubuntu-source-package",
+                    "sourcePackage": "alpha",
+                    "sourceVersion": "1.0-1",
+                },
+            },
+            {
+                "sourceId": "two",
+                "source": {
+                    "type": "ubuntu-source-package",
+                    "sourcePackage": "beta",
+                    "sourceVersion": "2.0-1",
+                },
+            },
+        ]
+        image = {"distribution": "ubuntu", "version": "26.04"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            def fake_fetch(unit, destination, _options):
+                (destination / f"{unit['sourceId']}.dsc").write_text(
+                    "source", encoding="utf-8"
+                )
+
+            with (
+                mock.patch.object(fetcher, "require_tool"),
+                mock.patch.object(fetcher, "run") as mocked_run,
+                mock.patch.object(
+                    fetcher, "_fetch_ubuntu_unit", side_effect=fake_fetch
+                ) as mocked_fetch,
+            ):
+                fetcher._materialize_ubuntu(units, image, root)
+
+            self.assertEqual(mocked_run.call_count, 1)
+            self.assertIn("update", mocked_run.call_args.args[0])
+            self.assertEqual(mocked_fetch.call_count, 2)
+            self.assertTrue((root / "one" / "one.dsc").is_file())
+            self.assertTrue((root / "two" / "two.dsc").is_file())
+
+    def test_rocky_full_fetch_consumes_dynamic_plan_with_bounded_workers(self):
+        units = [
+            {
+                "sourceId": f"source-{number}",
+                "source": {
+                    "type": "rocky-source-rpm",
+                    "sourceArtifact": f"pkg-{number}.src.rpm",
+                    "sourceVersion": f"{number}-1.el9",
+                },
+            }
+            for number in range(5)
+        ]
+        image = {"distribution": "rocky", "version": "9.8"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            def fake_fetch(unit, _image, destination):
+                artifact = unit["source"]["sourceArtifact"]
+                (destination / artifact).write_bytes(b"srpm")
+
+            with (
+                mock.patch.object(fetcher, "require_tool"),
+                mock.patch.object(fetcher, "fetch_rocky", side_effect=fake_fetch) as mocked,
+                mock.patch.object(
+                    fetcher.concurrent.futures, "ThreadPoolExecutor", wraps=fetcher.concurrent.futures.ThreadPoolExecutor
+                ) as executor,
+            ):
+                fetcher._materialize_rocky(units, image, root, workers=2)
+
+            self.assertEqual(mocked.call_count, len(units))
+            self.assertEqual(executor.call_args.kwargs["max_workers"], 2)
+            for unit in units:
+                self.assertTrue(
+                    (root / unit["sourceId"] / unit["source"]["sourceArtifact"]).is_file()
+                )
+
+    def test_materialize_rejects_zero_workers(self):
+        plan = {
+            "schemaVersion": 1,
+            "coveragePolicy": "all-installed-packages",
+            "image": {"distribution": "rocky", "version": "9.8"},
+            "sources": [{"sourceId": "x", "source": {}}],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "workers must be at least 1"):
+                fetcher.materialize(
+                    plan,
+                    Path(tmpdir) / "out",
+                    Path(tmpdir) / "cache",
+                    workers=0,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
