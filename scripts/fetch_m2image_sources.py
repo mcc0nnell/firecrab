@@ -238,28 +238,34 @@ def fetch_alpine(unit: dict, destination: Path, cache_dir: Path) -> None:
             raise ValueError(f"Alpine APKBUILD export missing for {package}@{commit}")
         shutil.copytree(exported, recipe_root, dirs_exist_ok=True)
 
-    run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{recipe_root.resolve()}:/src:ro",
-            "-v",
-            f"{distfiles.resolve()}:/dist",
-            "alpine:3.24",
-            "sh",
-            "-lc",
-            (
-                "set -eu; "
-                "apk add --no-cache alpine-sdk >/dev/null; "
-                "adduser -D builder; "
-                "chown builder:builder /dist; "
-                "su builder -c 'cd /src && SRCDEST=/dist abuild fetch'; "
-                "chmod -R a+rX /dist"
-            ),
-        ]
-    )
+    # abuild creates a local src/ work directory while fetching. Preserve the
+    # exact git-archive recipe as immutable evidence and give abuild a disposable
+    # writable copy so generated work files never contaminate the source bundle.
+    with tempfile.TemporaryDirectory(prefix="firecrab-abuild-fetch-") as tmpdir:
+        work_root = Path(tmpdir) / "recipe"
+        shutil.copytree(recipe_root, work_root)
+        run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{work_root.resolve()}:/src",
+                "-v",
+                f"{distfiles.resolve()}:/dist",
+                "alpine:3.24",
+                "sh",
+                "-lc",
+                (
+                    "set -eu; "
+                    "apk add --no-cache alpine-sdk >/dev/null; "
+                    "adduser -D builder; "
+                    "chown -R builder:builder /src /dist; "
+                    "su builder -c 'cd /src && SRCDEST=/dist abuild fetch'; "
+                    "chmod -R a+rX /dist"
+                ),
+            ]
+        )
     (destination / "APORTS_COMMIT.txt").write_text(commit + "\n", encoding="utf-8")
 
 
