@@ -188,11 +188,46 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y e2fsprogs file gzip tar curl zstd xz-utils jq dpkg-dev
 
+      - name: Prime Alpine source fetch toolchain
+        run: |
+          set -euo pipefail
+          docker build -t firecrab-alpine-source-fetch:3.24 - <<'DOCKERFILE'
+          FROM alpine:3.24
+          RUN apk add --no-cache alpine-sdk
+          DOCKERFILE
+          # The fetcher intentionally uses the distribution image name. In this
+          # disposable validation runner, retag the prepared child so all 47
+          # source units reuse alpine-sdk instead of reinstalling it 47 times.
+          docker tag firecrab-alpine-source-fetch:3.24 alpine:3.24
+
       - name: Build Alpine M2Image and frozen source plan
         env:
           ZSTD_LEVEL: '1'
           ZSTD_THREADS: '2'
         run: scripts/build-m2images.sh --alias alpine-3.24.1 --arch x86_64
+
+      - name: Prime exact aports commits
+        run: |
+          set -euo pipefail
+          plan=images/compliance/alpine-3.24.1-x86_64/source-publication-plan.json
+          cache=.cache/m2image-sources/aports.git
+          mkdir -p "$(dirname "$cache")"
+          git init --bare "$cache"
+          git --git-dir="$cache" remote add origin https://gitlab.alpinelinux.org/alpine/aports.git
+          mapfile -t commits < <(python3 - "$plan" <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1], encoding='utf-8'))
+          print('\n'.join(sorted({item['source']['repositoryCommit'] for item in plan['sources']})))
+          PY
+          )
+          echo "priming ${#commits[@]} exact aports commits"
+          if ! git --git-dir="$cache" fetch --depth=1 origin "${commits[@]}"; then
+            echo 'batch commit fetch unavailable; falling back to exact commits one by one'
+            for commit in "${commits[@]}"; do
+              git --git-dir="$cache" cat-file -e "${commit}^{commit}" 2>/dev/null \
+                || git --git-dir="$cache" fetch --depth=1 origin "$commit"
+            done
+          fi
 
       - name: Materialize every installed package source and package it
         env:
