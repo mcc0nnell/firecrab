@@ -2,14 +2,15 @@
 """Materialize exact source artifacts described by an M2Image source plan.
 
 This deliberately consumes the normalized plan rather than rediscovering package
-metadata.  Each source unit lands under sources/<sourceId>/ and is then hashed
-by m2image_source_publication.py so a release can bind installed binaries to the
+metadata. Each source unit lands under sources/<sourceId>/ and is then hashed by
+m2image_source_publication.py so a release can bind installed binaries to the
 source bytes it actually publishes.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import importlib.util
 import json
@@ -33,7 +34,9 @@ _spec.loader.exec_module(sourcepub)
 UBUNTU_CODENAMES = {
     "26.04": "resolute",
 }
+UBUNTU_COMPONENTS = "main universe restricted multiverse"
 ROCKY_SOURCE_REPOS = ("BaseOS", "AppStream", "CRB")
+DEFAULT_SOURCE_FETCH_WORKERS = 8
 SHA512_RE = re.compile(r"^[0-9a-fA-F]{128}$")
 
 
@@ -67,6 +70,11 @@ def fetch_url(url: str, output: Path) -> bool:
             "--show-error",
             "--retry",
             "2",
+            "--retry-all-errors",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "180",
             "--output",
             str(output),
             url,
@@ -123,42 +131,53 @@ def _apt_options(root: Path, sources: Path) -> list[str]:
     ]
 
 
-def fetch_ubuntu(unit: dict, image: dict, destination: Path) -> None:
-    require_tool("apt-get")
-    source = unit["source"]
-    package = str(source["sourcePackage"])
-    version = str(source["sourceVersion"])
+def _ubuntu_apt_options(image: dict, apt_root: Path) -> list[str]:
     image_version = str(image.get("version") or "")
     codename = UBUNTU_CODENAMES.get(image_version)
     if not codename:
         raise ValueError(f"no Ubuntu source codename mapping for image version {image_version!r}")
+    sources = apt_root / "sources.list"
+    sources.write_text(
+        f"deb-src http://archive.ubuntu.com/ubuntu {codename} {UBUNTU_COMPONENTS}\n"
+        f"deb-src http://archive.ubuntu.com/ubuntu {codename}-updates {UBUNTU_COMPONENTS}\n"
+        f"deb-src http://archive.ubuntu.com/ubuntu {codename}-backports {UBUNTU_COMPONENTS}\n"
+        f"deb-src http://security.ubuntu.com/ubuntu {codename}-security {UBUNTU_COMPONENTS}\n",
+        encoding="utf-8",
+    )
+    return _apt_options(apt_root, sources)
 
-    with tempfile.TemporaryDirectory(prefix="firecrab-apt-source-") as tmpdir:
-        apt_root = Path(tmpdir)
-        sources = apt_root / "sources.list"
-        components = "main universe restricted multiverse"
-        sources.write_text(
-            f"deb-src http://archive.ubuntu.com/ubuntu {codename} {components}\n"
-            f"deb-src http://archive.ubuntu.com/ubuntu {codename}-updates {components}\n"
-            f"deb-src http://archive.ubuntu.com/ubuntu {codename}-backports {components}\n"
-            f"deb-src http://security.ubuntu.com/ubuntu {codename}-security {components}\n",
-            encoding="utf-8",
-        )
-        options = _apt_options(apt_root, sources)
-        run(["apt-get", *options, "update"])
-        run(
-            [
-                "apt-get",
-                *options,
-                "source",
-                "--download-only",
-                f"{package}={version}",
-            ],
-            cwd=destination,
-        )
+
+def _fetch_ubuntu_unit(unit: dict, destination: Path, options: list[str]) -> None:
+    source = unit["source"]
+    package = str(source["sourcePackage"])
+    version = str(source["sourceVersion"])
+    run(
+        [
+            "apt-get",
+            *options,
+            "source",
+            "--download-only",
+            f"{package}={version}",
+        ],
+        cwd=destination,
+    )
     files = [path for path in destination.iterdir() if path.is_file()]
     if not files:
         raise ValueError(f"apt-get source published no files for {package}={version}")
+
+
+def fetch_ubuntu(unit: dict, image: dict, destination: Path) -> None:
+    """Fetch one Ubuntu source unit.
+
+    Kept as the single-unit API for focused validation. Full-image materialization
+    uses one shared apt index so it does not refresh source metadata per package.
+    """
+
+    require_tool("apt-get")
+    with tempfile.TemporaryDirectory(prefix="firecrab-apt-source-") as tmpdir:
+        options = _ubuntu_apt_options(image, Path(tmpdir))
+        run(["apt-get", *options, "update"])
+        _fetch_ubuntu_unit(unit, destination, options)
 
 
 def _ensure_aports(cache: Path, commit: str) -> Path:
@@ -215,7 +234,7 @@ def _literal_sha512sums(apkbuild: Path) -> dict[str, str]:
     """Read the literal sha512sums block without executing an APKBUILD.
 
     Alpine's archived distfiles are accepted only when the exact aports recipe
-    carries a literal SHA-512 for that filename.  Dynamic/unsupported checksum
+    carries a literal SHA-512 for that filename. Dynamic/unsupported checksum
     syntax deliberately yields no fallback rather than weakening verification.
     """
 
@@ -263,8 +282,6 @@ def _recover_alpine_distfiles(recipe_root: Path, distfiles: Path, image: dict) -
     branch = _alpine_distfiles_branch(image)
     recovered: list[str] = []
     for filename, expected in sorted(checksums.items()):
-        # Local patches/configs exported with the exact aports recipe are not
-        # remote distfiles. Existing downloads also need no recovery.
         if (recipe_root / filename).is_file() or (distfiles / filename).is_file():
             continue
         target = distfiles / filename
@@ -340,19 +357,12 @@ def fetch_alpine(unit: dict, image: dict, destination: Path, cache_dir: Path) ->
             raise ValueError(f"Alpine APKBUILD export missing for {package}@{commit}")
         shutil.copytree(exported, recipe_root, dirs_exist_ok=True)
 
-    # abuild creates a local src/ work directory while fetching. Preserve the
-    # exact git-archive recipe as immutable evidence and give abuild a disposable
-    # writable copy so generated work files never contaminate the source bundle.
     with tempfile.TemporaryDirectory(prefix="firecrab-abuild-fetch-") as tmpdir:
         work_root = Path(tmpdir) / "recipe"
         shutil.copytree(recipe_root, work_root)
         first_rc = _alpine_abuild_fetch(work_root, distfiles)
         recovered: list[str] = []
         if first_rc:
-            # Historical upstream URLs can disappear after Alpine has built the
-            # binary. Alpine's distfiles archive is the fail-closed recovery
-            # source: only exact files whose SHA-512 is frozen in this exact
-            # APKBUILD are admitted, then abuild verifies the completed set too.
             recovered = _recover_alpine_distfiles(recipe_root, distfiles, image)
             if not recovered:
                 raise subprocess.CalledProcessError(first_rc, "abuild fetch")
@@ -367,13 +377,74 @@ def fetch_alpine(unit: dict, image: dict, destination: Path, cache_dir: Path) ->
         )
 
 
-def materialize(plan: dict, output_dir: Path, cache_dir: Path) -> dict:
+def _materialize_rocky(
+    sources: list[dict], image: dict, source_root: Path, workers: int
+) -> None:
+    require_tool("curl")
+    active_workers = min(workers, len(sources))
+    print(
+        f"m2image source fetch: rocky sources={len(sources)} workers={active_workers}",
+        flush=True,
+    )
+
+    def fetch_one(unit: dict) -> tuple[str, str]:
+        source_id = str(unit.get("sourceId") or "")
+        if not source_id:
+            raise ValueError("Rocky source unit is missing sourceId")
+        destination = source_root / source_id
+        destination.mkdir()
+        fetch_rocky(unit, image, destination)
+        return source_id, str((unit.get("source") or {}).get("sourceArtifact") or "")
+
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=active_workers) as pool:
+        futures = [pool.submit(fetch_one, unit) for unit in sources]
+        for future in concurrent.futures.as_completed(futures):
+            source_id, artifact = future.result()
+            completed += 1
+            print(
+                f"m2image source fetch: rocky {completed}/{len(sources)} "
+                f"{artifact} ({source_id})",
+                flush=True,
+            )
+
+
+def _materialize_ubuntu(sources: list[dict], image: dict, source_root: Path) -> None:
+    require_tool("apt-get")
+    with tempfile.TemporaryDirectory(prefix="firecrab-apt-sources-") as tmpdir:
+        options = _ubuntu_apt_options(image, Path(tmpdir))
+        print("m2image source fetch: ubuntu refreshing source indexes once", flush=True)
+        run(["apt-get", *options, "update"])
+        for number, unit in enumerate(sources, start=1):
+            source_id = str(unit.get("sourceId") or "")
+            source = unit.get("source") or {}
+            if source.get("type") != "ubuntu-source-package" or not source_id:
+                raise ValueError(f"malformed Ubuntu source unit: {unit!r}")
+            destination = source_root / source_id
+            destination.mkdir()
+            print(
+                f"m2image source fetch: ubuntu {number}/{len(sources)} "
+                f"{source.get('sourcePackage')}={source.get('sourceVersion')} ({source_id})",
+                flush=True,
+            )
+            _fetch_ubuntu_unit(unit, destination, options)
+
+
+def materialize(
+    plan: dict,
+    output_dir: Path,
+    cache_dir: Path,
+    *,
+    workers: int = DEFAULT_SOURCE_FETCH_WORKERS,
+) -> dict:
     if plan.get("schemaVersion") != 1 or plan.get("coveragePolicy") != "all-installed-packages":
         raise ValueError("unsupported source publication plan")
     image = plan.get("image")
     sources = plan.get("sources")
-    if not isinstance(image, dict) or not isinstance(sources, list):
-        raise ValueError("source publication plan is malformed")
+    if not isinstance(image, dict) or not isinstance(sources, list) or not sources:
+        raise ValueError("source publication plan is malformed or has no source units")
+    if workers < 1:
+        raise ValueError("source fetch workers must be at least 1")
     distribution = str(image.get("distribution") or "").lower()
 
     source_root = output_dir / "sources"
@@ -381,23 +452,24 @@ def materialize(plan: dict, output_dir: Path, cache_dir: Path) -> dict:
         shutil.rmtree(output_dir)
     source_root.mkdir(parents=True)
 
-    for index, unit in enumerate(sources, start=1):
-        source_id = str(unit.get("sourceId") or "")
-        destination = source_root / source_id
-        destination.mkdir()
-        print(
-            f"m2image source fetch: {distribution} {index}/{len(sources)} "
-            f"{source_id}",
-            flush=True,
-        )
-        if distribution == "rocky":
-            fetch_rocky(unit, image, destination)
-        elif distribution == "ubuntu":
-            fetch_ubuntu(unit, image, destination)
-        elif distribution == "alpine":
+    if distribution == "rocky":
+        _materialize_rocky(sources, image, source_root, workers)
+    elif distribution == "ubuntu":
+        _materialize_ubuntu(sources, image, source_root)
+    elif distribution == "alpine":
+        for index, unit in enumerate(sources, start=1):
+            source_id = str(unit.get("sourceId") or "")
+            if not source_id:
+                raise ValueError("Alpine source unit is missing sourceId")
+            destination = source_root / source_id
+            destination.mkdir()
+            print(
+                f"m2image source fetch: alpine {index}/{len(sources)} {source_id}",
+                flush=True,
+            )
             fetch_alpine(unit, image, destination, cache_dir)
-        else:
-            raise ValueError(f"unsupported source materializer distribution: {distribution!r}")
+    else:
+        raise ValueError(f"unsupported source materializer distribution: {distribution!r}")
 
     index = sourcepub.source_index(plan, source_root)
     (output_dir / "source-index.json").write_text(
@@ -418,11 +490,22 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path(os.environ.get("M2IMAGE_SOURCE_CACHE", ".cache/m2image-sources")),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("M2IMAGE_SOURCE_WORKERS", DEFAULT_SOURCE_FETCH_WORKERS)),
+        help="bounded parallelism for independently fetchable source units",
+    )
     args = parser.parse_args(argv)
     try:
         with args.plan.open(encoding="utf-8") as stream:
             plan = json.load(stream)
-        index = materialize(plan, args.output_dir, args.cache_dir)
+        index = materialize(
+            plan,
+            args.output_dir,
+            args.cache_dir,
+            workers=args.workers,
+        )
     except (OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as exc:
         print(f"m2image source fetch: {exc}", file=sys.stderr)
         return 2
