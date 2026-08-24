@@ -135,7 +135,7 @@ class FireCrabBuildExecutor:
             "microNetworkId": self.profile.micro_network_id,
             "shellIds": [shell_id],
             "portForwards": [],
-            "env": {"CI": "true"},
+            "env": {},
         }
         if self.profile.storage_root:
             vm_body["storageRoot"] = self.profile.storage_root
@@ -298,7 +298,7 @@ def _phase_for_vm_state(state: str) -> str:
 
 
 def _build_script(command: str) -> str:
-    return "#!/bin/sh\nset -e\n" + command.rstrip() + "\n"
+    return "#!/bin/sh\nset -e\nexport CI=true\n" + command.rstrip() + "\n"
 
 
 def _build_name(label: str) -> str:
