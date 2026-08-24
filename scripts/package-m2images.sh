@@ -152,9 +152,13 @@ info "writing ${out_dir}/SHA256SUMS"
   cd "$out_dir"
   : >SHA256SUMS
   # Ignore stale archives from aliases removed from the current manifest.
-  # They may be useful for rollback, but must not become part of this release.
+  # Source archives are sibling release artifacts and must survive a binary
+  # repack instead of silently falling out of the checksum contract.
   for alias in "${known_aliases[@]}"; do
-    [ ! -f "${alias}.tar.zst" ] || sha256sum "${alias}.tar.zst" >>SHA256SUMS
+    for suffix in '.tar.zst' '.sources.tar.zst'; do
+      candidate="${alias}${suffix}"
+      [ ! -f "$candidate" ] || sha256sum "$candidate" >>SHA256SUMS
+    done
   done
 )
 
