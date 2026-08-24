@@ -108,11 +108,12 @@ export FIRECRAB_MCP_BUILD_EGRESS_POLICY=internet
 Both `FIRECRAB_MCP_ALLOW_MUTATIONS=1` and a valid build runner profile are
 required before `triggerBuild` can create infrastructure.
 
-Build VMs use the `ci-` name prefix, and build-specific stop/read operations
-verify that prefix before treating an arbitrary VM as a build. The first build
-slice intentionally retains the VM and Shell revision as evidence; garbage
-collection and retention policy are follow-on work rather than silently adding
-delete authority to this MCP.
+Build VMs use a unique `ci-` name and pin a FireCrab Shell with the same build
+name. Build-specific stop/read operations require both facts before treating a
+VM as a build, so an ordinary VM cannot opt into build mutation merely by using
+the prefix. The first build slice intentionally retains the VM and Shell
+revision as evidence; garbage collection and retention policy are follow-on
+work rather than silently adding delete authority to this MCP.
 
 ### Current build boundary
 
