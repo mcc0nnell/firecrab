@@ -10,6 +10,7 @@ from firecrab_mcp.server import (
     FireCrabClient,
     FireCrabExecutor,
     FireCrabMcpError,
+    FireCrabPolicy,
 )
 
 
@@ -34,7 +35,7 @@ class FakeResponse:
         return self._data
 
 
-def test_talkpipe_pipeline_calls_firecrab_and_preserves_request_id() -> None:
+def test_talkpipe_pipeline_calls_firecrab_and_preserves_evidence() -> None:
     calls: list[tuple[str, str, dict[str, Any]]] = []
 
     def request_fn(method: str, url: str, **kwargs: Any) -> requests.Response:
@@ -50,11 +51,15 @@ def test_talkpipe_pipeline_calls_firecrab_and_preserves_request_id() -> None:
 
     result = executor.execute("GET", "/api/vms")
 
-    assert result == {
-        "statusCode": 200,
-        "requestId": "req-test",
-        "data": [{"id": "vm-1"}],
+    assert result["operation"] == {
+        "method": "GET",
+        "path": "/api/vms",
+        "risk": "read",
     }
+    assert result["statusCode"] == 200
+    assert result["requestId"] == "req-test"
+    assert result["durationMs"] >= 0
+    assert result["data"] == [{"id": "vm-1"}]
     assert calls == [
         (
             "GET",
@@ -64,18 +69,40 @@ def test_talkpipe_pipeline_calls_firecrab_and_preserves_request_id() -> None:
     ]
 
 
-def test_create_body_passes_through_without_reencoding_firecrab_schema() -> None:
+def test_mutations_are_denied_before_http_by_default() -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    def request_fn(*args: Any, **kwargs: Any) -> requests.Response:
+        calls.append(args)
+        return FakeResponse(201, {"id": "vm-2"})  # type: ignore[return-value]
+
+    executor = FireCrabExecutor(
+        FireCrabClient(request_fn=request_fn),
+        policy=FireCrabPolicy(allow_mutations=False),
+    )
+
+    with pytest.raises(FireCrabMcpError, match="mutating FireCrab MCP tools are disabled"):
+        executor.execute("POST", "/api/vms", {"name": "ci-runner"})
+
+    assert calls == []
+
+
+def test_create_body_passes_through_when_mutations_are_enabled() -> None:
     seen: dict[str, Any] = {}
 
     def request_fn(method: str, url: str, **kwargs: Any) -> requests.Response:
         seen.update({"method": method, "url": url, **kwargs})
         return FakeResponse(201, {"id": "vm-2"})  # type: ignore[return-value]
 
-    executor = FireCrabExecutor(FireCrabClient(request_fn=request_fn))
+    executor = FireCrabExecutor(
+        FireCrabClient(request_fn=request_fn),
+        policy=FireCrabPolicy(allow_mutations=True),
+    )
     spec = {"name": "ci-runner", "vcpuCount": 2}
 
     result = executor.execute("POST", "/api/vms", spec)
 
+    assert result["operation"]["risk"] == "mutate"
     assert result["statusCode"] == 201
     assert seen["json"] is spec
 
@@ -84,6 +111,7 @@ def test_create_body_passes_through_without_reencoding_firecrab_schema() -> None
     ("method", "path"),
     [
         ("PATCH", "/api/vms/x"),
+        ("DELETE", "/api/vms/x"),
         ("GET", "/not-api/vms"),
         ("GET", "/api/../secret"),
     ],
@@ -102,6 +130,11 @@ def test_pipeline_rejects_requests_outside_explicit_contract(
 def test_invalid_base_url_is_rejected() -> None:
     with pytest.raises(FireCrabMcpError):
         FireCrabClient("file:///tmp/firecrab.sock")
+
+
+def test_base_url_rejects_embedded_credentials() -> None:
+    with pytest.raises(FireCrabMcpError):
+        FireCrabClient("http://user:secret@127.0.0.1:5523")
 
 
 def test_api_error_is_bounded() -> None:
