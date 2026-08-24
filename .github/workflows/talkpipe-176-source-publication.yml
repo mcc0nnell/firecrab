@@ -18,7 +18,11 @@ jobs:
           ref: validation/176-corresponding-source-publication
 
       - name: Unit tests
-        run: python3 -m unittest scripts/test_m2image_source_publication.py
+        run: |
+          python3 -m unittest \
+            scripts/test_m2image_sbom.py \
+            scripts/test_m2image_compliance.py \
+            scripts/test_m2image_source_publication.py
 
       - name: TalkPipe in python:3.12-slim
         run: |
@@ -74,12 +78,19 @@ jobs:
           assert plan['coveragePolicy'] == 'all-installed-packages'
           assert plan['packageCount'] > 0
           assert plan['sourceCount'] > 0
-          covered = sum(len(item['binaryPackages']) for item in plan['sources'])
-          assert covered == plan['packageCount'], (covered, plan['packageCount'])
+          source_backed = sum(len(item['binaryPackages']) for item in plan['sources'])
+          non_source = len(plan['nonSourcePackages'])
+          assert source_backed == plan['sourceBackedPackageCount']
+          assert non_source == plan['nonSourcePackageCount']
+          assert source_backed + non_source == plan['packageCount'], (
+              source_backed, non_source, plan['packageCount']
+          )
           print(
               'source plan:',
               plan['image']['distribution'],
               f"packages={plan['packageCount']}",
+              f"source_backed={source_backed}",
+              f"non_source={non_source}",
               f"sources={plan['sourceCount']}",
           )
           PY
