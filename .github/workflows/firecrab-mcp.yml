@@ -1,0 +1,31 @@
+name: FireCrab MCP
+
+on:
+  pull_request:
+    paths:
+      - 'firecrab-mcp/**'
+      - '.github/workflows/firecrab-mcp.yml'
+  push:
+    branches:
+      - feat/talkpipe-firecrab-mcp
+    paths:
+      - 'firecrab-mcp/**'
+      - '.github/workflows/firecrab-mcp.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: firecrab-mcp/pyproject.toml
+      - name: Install MCP adapter
+        run: python -m pip install -e './firecrab-mcp[dev]'
+      - name: Test TalkPipe MCP adapter
+        run: pytest firecrab-mcp/tests
