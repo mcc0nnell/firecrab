@@ -24,10 +24,20 @@ from urllib.parse import urlsplit
 
 import requests
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
 from talkpipe.pipe import core
 
 _ALLOWED_METHODS = frozenset({"GET", "POST"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_READ_ONLY_TOOL = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+)
+_MUTATING_TOOL = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+)
 
 
 class FireCrabMcpError(RuntimeError):
@@ -237,43 +247,71 @@ mcp = MCPServer(
 )
 
 
-@mcp.tool()
+@mcp.tool(
+    title="FireCrab status",
+    annotations=_READ_ONLY_TOOL,
+    structured_output=True,
+)
 def getStatus() -> dict[str, Any]:
     """Get FireCrab host health/readiness information."""
     return _executor.execute("GET", "/api/host")
 
 
-@mcp.tool()
+@mcp.tool(
+    title="List FireCrab VMs",
+    annotations=_READ_ONLY_TOOL,
+    structured_output=True,
+)
 def listVMs() -> dict[str, Any]:
     """List FireCrab virtual machines."""
     return _executor.execute("GET", "/api/vms")
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get FireCrab VM",
+    annotations=_READ_ONLY_TOOL,
+    structured_output=True,
+)
 def getVM(vmId: str) -> dict[str, Any]:
     """Get one FireCrab virtual machine by ID."""
     return _executor.execute("GET", f"/api/vms/{_id_segment(vmId)}")
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Create FireCrab VM",
+    annotations=_MUTATING_TOOL,
+    structured_output=True,
+)
 def createVM(spec: dict[str, Any]) -> dict[str, Any]:
     """Create a FireCrab VM. Requires the mutation policy opt-in."""
     return _executor.execute("POST", "/api/vms", spec)
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Start FireCrab VM",
+    annotations=_MUTATING_TOOL,
+    structured_output=True,
+)
 def startVM(vmId: str) -> dict[str, Any]:
     """Start a FireCrab virtual machine. Requires the mutation policy opt-in."""
     return _executor.execute("POST", f"/api/vms/{_id_segment(vmId)}/start")
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Stop FireCrab VM",
+    annotations=_MUTATING_TOOL,
+    structured_output=True,
+)
 def stopVM(vmId: str) -> dict[str, Any]:
     """Stop a FireCrab virtual machine. Requires the mutation policy opt-in."""
     return _executor.execute("POST", f"/api/vms/{_id_segment(vmId)}/stop")
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Read FireCrab VM log",
+    annotations=_READ_ONLY_TOOL,
+    structured_output=True,
+)
 def getVMLog(vmId: str) -> dict[str, Any]:
     """Read the FireCrab log for one virtual machine."""
     return _executor.execute("GET", f"/api/vms/{_id_segment(vmId)}/log")
