@@ -37,6 +37,16 @@ def package(name, version, source, license_text=None):
     }
 
 
+def gpg_pubkey():
+    return {
+        "binaryPackage": "gpg-pubkey",
+        "binaryVersion": "0:350d275d-627e00a1",
+        "architecture": "x86_64",
+        "declaredLicense": "pubkey",
+        "sourceDisposition": "rpm-key-metadata",
+    }
+
+
 class SourcePublicationTests(unittest.TestCase):
     def test_alpine_deduplicates_subpackages_by_exact_source_identity(self):
         src = {
@@ -55,6 +65,8 @@ class SourcePublicationTests(unittest.TestCase):
             )
         )
         self.assertEqual(plan["packageCount"], 2)
+        self.assertEqual(plan["sourceBackedPackageCount"], 2)
+        self.assertEqual(plan["nonSourcePackageCount"], 0)
         self.assertEqual(plan["sourceCount"], 1)
         self.assertEqual(len(plan["sources"][0]["binaryPackages"]), 2)
         self.assertEqual(plan["coveragePolicy"], "all-installed-packages")
@@ -96,6 +108,30 @@ class SourcePublicationTests(unittest.TestCase):
                     ],
                 )
             )
+
+    def test_rocky_gpg_pubkey_is_covered_without_fake_source_unit(self):
+        src = {
+            "type": "rocky-source-rpm",
+            "sourceArtifact": "bash-5.1.8-9.el9.src.rpm",
+            "sourceVersion": "0:5.1.8-9.el9",
+        }
+        plan = sourcepub.publication_plan(
+            source_map(
+                "rocky",
+                [package("bash", "0:5.1.8-9.el9", src, "GPLv3+"), gpg_pubkey()],
+            )
+        )
+        self.assertEqual(plan["packageCount"], 2)
+        self.assertEqual(plan["sourceBackedPackageCount"], 1)
+        self.assertEqual(plan["nonSourcePackageCount"], 1)
+        self.assertEqual(plan["sourceCount"], 1)
+        self.assertEqual(plan["nonSourcePackages"][0]["name"], "gpg-pubkey")
+
+    def test_non_source_disposition_cannot_exempt_real_package(self):
+        record = gpg_pubkey()
+        record["binaryPackage"] = "bash"
+        with self.assertRaisesRegex(ValueError, "unsupported non-source disposition"):
+            sourcepub.publication_plan(source_map("rocky", [record]))
 
     def test_plan_rejects_duplicate_binary_records(self):
         src = {
@@ -160,6 +196,29 @@ class SourcePublicationTests(unittest.TestCase):
             for item in index["sources"][0]["files"]:
                 self.assertEqual(len(item["sha256"]), 64)
                 self.assertTrue(item["path"].startswith("sources/"))
+
+    def test_index_counts_explicit_non_source_coverage(self):
+        src = {
+            "type": "rocky-source-rpm",
+            "sourceArtifact": "bash-5.1.8-9.el9.src.rpm",
+            "sourceVersion": "0:5.1.8-9.el9",
+        }
+        plan = sourcepub.publication_plan(
+            source_map(
+                "rocky",
+                [package("bash", "0:5.1.8-9.el9", src), gpg_pubkey()],
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = Path(tmpdir) / "bundle"
+            source_root = bundle / "sources"
+            unit_dir = source_root / plan["sources"][0]["sourceId"]
+            unit_dir.mkdir(parents=True)
+            (unit_dir / "bash.src.rpm").write_bytes(b"srpm")
+            index = sourcepub.source_index(plan, source_root)
+            self.assertEqual(index["packageCount"], 2)
+            self.assertEqual(index["sourceBackedPackageCount"], 1)
+            self.assertEqual(index["nonSourcePackageCount"], 1)
 
     def test_plan_json_is_deterministic_across_input_order(self):
         a = package(
