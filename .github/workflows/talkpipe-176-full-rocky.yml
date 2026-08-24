@@ -1,0 +1,113 @@
+name: TalkPipe #176 full Rocky sources
+
+on:
+  pull_request:
+    branches: [fix/host-license-artifacts-176]
+
+permissions:
+  contents: read
+
+jobs:
+  full-rocky-source-archive:
+    name: Full source archive (rocky-9.8)
+    if: github.event.pull_request.head.ref == 'validation/176-corresponding-source-publication'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: validation/176-corresponding-source-publication
+
+      - name: Install real-image/source tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs file gzip tar curl zstd xz-utils jq dpkg-dev
+
+      - name: Source publication regression tests
+        run: |
+          python3 -m unittest \
+            scripts/test_m2image_source_publication.py \
+            scripts/test_fetch_m2image_sources.py
+
+      - name: Build Rocky M2Image and frozen source plan
+        env:
+          ZSTD_LEVEL: '1'
+          ZSTD_THREADS: '2'
+        run: scripts/build-m2images.sh --alias rocky-9.8 --arch x86_64
+
+      - name: Verify frozen plan accounts for every installed package
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          plan = json.loads(Path(
+              'images/compliance/rocky-9.8-x86_64/source-publication-plan.json'
+          ).read_text())
+          assert plan['coveragePolicy'] == 'all-installed-packages'
+          assert plan['packageCount'] == 175
+          assert plan['sourceBackedPackageCount'] == 174
+          assert plan['nonSourcePackageCount'] == 1
+          assert plan['sourceCount'] == 88
+          assert len(plan['nonSourcePackages']) == 1
+          non_source = plan['nonSourcePackages'][0]
+          assert non_source['name'] == 'gpg-pubkey'
+          assert non_source['sourceDisposition'] == 'rpm-key-metadata'
+          print(
+              'Rocky frozen plan:',
+              f"packages={plan['packageCount']}",
+              f"sources={plan['sourceCount']}",
+              f"non_source={plan['nonSourcePackageCount']}",
+          )
+          PY
+          zstd -dc dist/m2images/x86_64/rocky-9.8.tar.zst \
+            | tar -tf - \
+            | grep -qx 'compliance/source-publication-plan.json'
+
+      - name: Materialize all exact Rocky source units in parallel
+        run: |
+          python3 .github/validation/materialize-rocky-sources.py \
+            images/compliance/rocky-9.8-x86_64/source-publication-plan.json \
+            full-rocky-source
+
+      - name: Package full corresponding-source archive
+        env:
+          ZSTD_LEVEL: '1'
+          ZSTD_THREADS: '2'
+        run: |
+          scripts/package-m2image-sources.sh \
+            --alias rocky-9.8 --arch x86_64 \
+            --materialized-dir full-rocky-source
+
+      - name: Verify complete exact-source archive
+        run: |
+          set -euo pipefail
+          archive=dist/m2images/x86_64/rocky-9.8.sources.tar.zst
+          verify=$(mktemp -d)
+          trap 'rm -rf "$verify"' EXIT
+          zstd -dc "$archive" | tar -x -C "$verify" \
+            source-publication-plan.json source-index.json
+          python3 - "$verify/source-publication-plan.json" "$verify/source-index.json" <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1], encoding='utf-8'))
+          index = json.load(open(sys.argv[2], encoding='utf-8'))
+          assert index['coveragePolicy'] == 'all-installed-packages'
+          assert index['packageCount'] == plan['packageCount'] == 175
+          assert index['sourceBackedPackageCount'] == plan['sourceBackedPackageCount'] == 174
+          assert index['nonSourcePackageCount'] == plan['nonSourcePackageCount'] == 1
+          assert index['sourceCount'] == plan['sourceCount'] == 88
+          assert index['fileCount'] >= index['sourceCount'] > 0
+          assert all(item['files'] for item in index['sources'])
+          assert len(index['nonSourcePackages']) == 1
+          assert index['nonSourcePackages'][0]['name'] == 'gpg-pubkey'
+          assert index['nonSourcePackages'][0]['sourceDisposition'] == 'rpm-key-metadata'
+          print(
+              'full Rocky exact-source archive:',
+              f"packages={index['packageCount']}",
+              f"source_backed={index['sourceBackedPackageCount']}",
+              f"non_source={index['nonSourcePackageCount']}",
+              f"sources={index['sourceCount']}",
+              f"files={index['fileCount']}",
+          )
+          PY
+          stat -c 'source archive bytes=%s' "$archive"
+          (cd dist/m2images/x86_64 && sha256sum -c SHA256SUMS)
