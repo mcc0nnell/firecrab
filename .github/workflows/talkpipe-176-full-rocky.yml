@@ -40,21 +40,52 @@ jobs:
           python3 - <<'PY'
           import json
           from pathlib import Path
+
           plan = json.loads(Path(
               'images/compliance/rocky-9.8-x86_64/source-publication-plan.json'
           ).read_text())
+
           assert plan['coveragePolicy'] == 'all-installed-packages'
-          assert plan['packageCount'] == 175
-          assert plan['sourceBackedPackageCount'] == 174
-          assert plan['nonSourcePackageCount'] == 1
-          assert plan['sourceCount'] == 88
-          assert len(plan['nonSourcePackages']) == 1
-          non_source = plan['nonSourcePackages'][0]
-          assert non_source['name'] == 'gpg-pubkey'
-          assert non_source['sourceDisposition'] == 'rpm-key-metadata'
+          assert plan['packageCount'] > 0
+          assert plan['sourceCount'] == len(plan['sources']) > 0
+          assert plan['nonSourcePackageCount'] == len(plan['nonSourcePackages'])
+
+          source_backed = sum(
+              len(unit['binaryPackages']) for unit in plan['sources']
+          )
+          assert source_backed == plan['sourceBackedPackageCount']
+          assert (
+              plan['sourceBackedPackageCount'] + plan['nonSourcePackageCount']
+              == plan['packageCount']
+          )
+
+          source_ids = [unit['sourceId'] for unit in plan['sources']]
+          assert len(source_ids) == len(set(source_ids))
+          for unit in plan['sources']:
+              assert unit['binaryPackages']
+              assert unit['bundlePath'] == f"sources/{unit['sourceId']}"
+
+          binary_keys = []
+          for unit in plan['sources']:
+              binary_keys.extend(
+                  (item['name'], item['version'], item['architecture'])
+                  for item in unit['binaryPackages']
+              )
+          binary_keys.extend(
+              (item['name'], item['version'], item['architecture'])
+              for item in plan['nonSourcePackages']
+          )
+          assert len(binary_keys) == plan['packageCount']
+          assert len(binary_keys) == len(set(binary_keys))
+
+          for non_source in plan['nonSourcePackages']:
+              assert non_source['name'] == 'gpg-pubkey'
+              assert non_source['sourceDisposition'] == 'rpm-key-metadata'
+
           print(
               'Rocky frozen plan:',
               f"packages={plan['packageCount']}",
+              f"source_backed={plan['sourceBackedPackageCount']}",
               f"sources={plan['sourceCount']}",
               f"non_source={plan['nonSourcePackageCount']}",
           )
@@ -88,18 +119,43 @@ jobs:
             source-publication-plan.json source-index.json
           python3 - "$verify/source-publication-plan.json" "$verify/source-index.json" <<'PY'
           import json, sys
+
           plan = json.load(open(sys.argv[1], encoding='utf-8'))
           index = json.load(open(sys.argv[2], encoding='utf-8'))
-          assert index['coveragePolicy'] == 'all-installed-packages'
-          assert index['packageCount'] == plan['packageCount'] == 175
-          assert index['sourceBackedPackageCount'] == plan['sourceBackedPackageCount'] == 174
-          assert index['nonSourcePackageCount'] == plan['nonSourcePackageCount'] == 1
-          assert index['sourceCount'] == plan['sourceCount'] == 88
-          assert index['fileCount'] >= index['sourceCount'] > 0
+
+          assert index['coveragePolicy'] == plan['coveragePolicy'] == 'all-installed-packages'
+          for field in (
+              'packageCount',
+              'sourceBackedPackageCount',
+              'nonSourcePackageCount',
+              'sourceCount',
+          ):
+              assert index[field] == plan[field]
+
+          assert index['sourceCount'] == len(index['sources']) == len(plan['sources']) > 0
+          assert index['nonSourcePackageCount'] == len(index['nonSourcePackages'])
+          assert index['nonSourcePackages'] == plan['nonSourcePackages']
+          assert index['fileCount'] == sum(
+              len(item['files']) for item in index['sources']
+          )
+          assert index['fileCount'] >= index['sourceCount']
           assert all(item['files'] for item in index['sources'])
-          assert len(index['nonSourcePackages']) == 1
-          assert index['nonSourcePackages'][0]['name'] == 'gpg-pubkey'
-          assert index['nonSourcePackages'][0]['sourceDisposition'] == 'rpm-key-metadata'
+
+          plan_sources = {unit['sourceId']: unit for unit in plan['sources']}
+          indexed_sources = {unit['sourceId']: unit for unit in index['sources']}
+          assert set(indexed_sources) == set(plan_sources)
+          for source_id, unit in indexed_sources.items():
+              assert unit['binaryPackages'] == plan_sources[source_id]['binaryPackages']
+
+          binary_coverage = sum(
+              len(item['binaryPackages']) for item in index['sources']
+          ) + len(index['nonSourcePackages'])
+          assert binary_coverage == index['packageCount']
+
+          for non_source in index['nonSourcePackages']:
+              assert non_source['name'] == 'gpg-pubkey'
+              assert non_source['sourceDisposition'] == 'rpm-key-metadata'
+
           print(
               'full Rocky exact-source archive:',
               f"packages={index['packageCount']}",
