@@ -27,6 +27,8 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from talkpipe.pipe import core
 
+from .builds import FireCrabBuildExecutor
+
 _ALLOWED_METHODS = frozenset({"GET", "POST"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _READ_ONLY_TOOL = ToolAnnotations(
@@ -37,6 +39,10 @@ _READ_ONLY_TOOL = ToolAnnotations(
 _MUTATING_TOOL = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=False,
+)
+_DESTRUCTIVE_TOOL = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
 )
 
 
@@ -237,12 +243,14 @@ class FireCrabExecutor:
 
 mcp = MCPServer(
     "FireCrab",
-    version="0.1.0",
+    version="0.2.0",
     instructions=(
-        "Explicit FireCrab management tools backed by the native API and "
-        "executed through TalkPipe. Reads are enabled by default. VM create, "
-        "start, and stop require FIRECRAB_MCP_ALLOW_MUTATIONS=1. Destructive "
-        "VM deletion is not exposed."
+        "Explicit FireCrab management and Jenkins-shaped build tools backed "
+        "by the native API and executed through TalkPipe. Reads are enabled "
+        "by default. VM lifecycle and build mutation tools require "
+        "FIRECRAB_MCP_ALLOW_MUTATIONS=1. Build runner template, network, and "
+        "resource sizing are operator configuration. Destructive VM deletion "
+        "is not exposed."
     ),
 )
 
@@ -315,6 +323,46 @@ def stopVM(vmId: str) -> dict[str, Any]:
 def getVMLog(vmId: str) -> dict[str, Any]:
     """Read the FireCrab log for one virtual machine."""
     return _executor.execute("GET", f"/api/vms/{_id_segment(vmId)}/log")
+
+
+@mcp.tool(
+    title="Trigger FireCrab build",
+    annotations=_MUTATING_TOOL,
+    structured_output=True,
+)
+def triggerBuild(label: str, command: str) -> dict[str, Any]:
+    """Start a shell-backed FireCrab build using operator-owned runner capacity."""
+    return _builds.trigger_build(label, command)
+
+
+@mcp.tool(
+    title="Get FireCrab build",
+    annotations=_READ_ONLY_TOOL,
+    structured_output=True,
+)
+def getBuild(buildId: str) -> dict[str, Any]:
+    """Get lifecycle and conclusion information for one FireCrab build."""
+    return _builds.get_build(buildId)
+
+
+@mcp.tool(
+    title="Read FireCrab build log",
+    annotations=_READ_ONLY_TOOL,
+    structured_output=True,
+)
+def getBuildLog(buildId: str) -> dict[str, Any]:
+    """Read command output for one FireCrab build from its serial evidence."""
+    return _builds.get_build_log(buildId)
+
+
+@mcp.tool(
+    title="Stop FireCrab build",
+    annotations=_DESTRUCTIVE_TOOL,
+    structured_output=True,
+)
+def stopBuild(buildId: str) -> dict[str, Any]:
+    """Stop a FireCrab build VM after verifying that it belongs to the build layer."""
+    return _builds.stop_build(buildId)
 
 
 def _id_segment(value: str) -> str:
@@ -408,6 +456,7 @@ def main() -> None:
 # Environment-dependent executor creation stays after helper definitions so
 # invalid operator configuration fails with the intended FireCrabMcpError.
 _executor = FireCrabExecutor()
+_builds = FireCrabBuildExecutor(_executor)
 
 
 if __name__ == "__main__":
