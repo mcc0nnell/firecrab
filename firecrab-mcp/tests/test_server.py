@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ from firecrab_mcp.server import (
     FireCrabExecutor,
     FireCrabMcpError,
     FireCrabPolicy,
+    mcp,
 )
 
 
@@ -154,3 +156,32 @@ def test_request_dataclass_is_typed_and_immutable() -> None:
     assert request.method == "GET"
     with pytest.raises(Exception):
         request.path = "/api/host"  # type: ignore[misc]
+
+
+def test_mcp_surface_publishes_jenkins_style_safety_annotations() -> None:
+    tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+
+    assert set(tools) == {
+        "getStatus",
+        "listVMs",
+        "getVM",
+        "createVM",
+        "startVM",
+        "stopVM",
+        "getVMLog",
+    }
+
+    for name in {"getStatus", "listVMs", "getVM", "getVMLog"}:
+        annotations = tools[name].annotations
+        assert annotations is not None
+        assert annotations.read_only_hint is True
+        assert annotations.destructive_hint is False
+        assert annotations.idempotent_hint is True
+        assert tools[name].output_schema is not None
+
+    for name in {"createVM", "startVM", "stopVM"}:
+        annotations = tools[name].annotations
+        assert annotations is not None
+        assert annotations.read_only_hint is False
+        assert annotations.destructive_hint is False
+        assert tools[name].output_schema is not None
