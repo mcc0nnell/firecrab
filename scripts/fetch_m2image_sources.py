@@ -241,6 +241,9 @@ def fetch_alpine(unit: dict, destination: Path, cache_dir: Path) -> None:
     # abuild creates a local src/ work directory while fetching. Preserve the
     # exact git-archive recipe as immutable evidence and give abuild a disposable
     # writable copy so generated work files never contaminate the source bundle.
+    # Keep the mounted scratch world-writable before and after the builder run;
+    # otherwise container UID ownership can make TemporaryDirectory cleanup fail
+    # on the host even after abuild itself succeeds.
     with tempfile.TemporaryDirectory(prefix="firecrab-abuild-fetch-") as tmpdir:
         work_root = Path(tmpdir) / "recipe"
         shutil.copytree(recipe_root, work_root)
@@ -260,9 +263,9 @@ def fetch_alpine(unit: dict, destination: Path, cache_dir: Path) -> None:
                     "set -eu; "
                     "apk add --no-cache alpine-sdk >/dev/null; "
                     "adduser -D builder; "
-                    "chown -R builder:builder /src /dist; "
+                    "chmod -R a+rwX /src /dist; "
                     "su builder -c 'cd /src && SRCDEST=/dist abuild fetch'; "
-                    "chmod -R a+rX /dist"
+                    "chmod -R a+rwX /src /dist"
                 ),
             ]
         )
