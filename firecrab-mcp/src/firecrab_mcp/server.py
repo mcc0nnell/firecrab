@@ -157,7 +157,6 @@ class FireCrabExecutor:
         return self._run(ApiRequest(method=method, path=path, body=body))
 
 
-_executor = FireCrabExecutor()
 mcp = MCPServer("FireCrab")
 
 
@@ -247,6 +246,12 @@ def _bounded_error_detail(value: Any, limit: int = 2048) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}…"
+
+
+# Construct the default executor only after all helpers used by FireCrabClient
+# exist. MCP tool functions resolve this global at invocation time, so tool
+# registration can remain close to the public interface above.
+_executor = FireCrabExecutor()
 
 
 def _build_parser() -> argparse.ArgumentParser:
