@@ -1,0 +1,110 @@
+name: TalkPipe container validation
+
+on:
+  pull_request:
+
+jobs:
+  talkpipe:
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    steps:
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@v7
+
+      - name: Fetch pinned Sandia TalkPipe
+        run: |
+          git clone --filter=blob:none https://github.com/sandialabs/talkpipe.git /tmp/talkpipe
+          git -C /tmp/talkpipe checkout 0ceb36bc1ab31df227c52a5eab990b61abd050bc
+          test "$(git -C /tmp/talkpipe rev-parse HEAD)" = 0ceb36bc1ab31df227c52a5eab990b61abd050bc
+
+      - name: Install Pipe API dependencies
+        run: pip install --no-cache-dir 'pydantic>=2.4.0' 'numpy>=1.22.2' greenlet
+
+      - name: Exercise warning-gate policy through TalkPipe
+        run: |
+          python - <<'PY'
+          import sys
+          import types
+          from pathlib import Path
+
+          # Load the exact pinned Pipe API without executing TalkPipe's broad
+          # top-level optional integrations.
+          pkg = types.ModuleType("talkpipe")
+          pkg.__path__ = ["/tmp/talkpipe/src/talkpipe"]
+          sys.modules["talkpipe"] = pkg
+
+          from talkpipe.pipe.core import segment, source
+
+          sys.path.insert(0, str(Path("scripts").resolve()))
+          import check_clippy_warnings as gate
+
+          baseline = {
+              "total": 3,
+              "packages": {"firecrab-api": 2, "firecrab-net-helper": 1},
+              "lints": {"clippy::collapsible_if": 1, "dead_code": 2},
+          }
+
+          @source()
+          def scenarios():
+              yield ("unchanged", baseline, "pass")
+              yield (
+                  "new-warning",
+                  {
+                      "total": 4,
+                      "packages": {"firecrab-api": 3, "firecrab-net-helper": 1},
+                      "lints": {
+                          "clippy::collapsible_if": 1,
+                          "dead_code": 2,
+                          "unused_imports": 1,
+                      },
+                  },
+                  "regression",
+              )
+              yield (
+                  "removed-warning",
+                  {
+                      "total": 2,
+                      "packages": {"firecrab-api": 2},
+                      "lints": {"clippy::collapsible_if": 1, "dead_code": 1},
+                  },
+                  "stale",
+              )
+              yield (
+                  "same-total-swap",
+                  {
+                      "total": 3,
+                      "packages": {"firecrab-api": 2, "firecrab-net-helper": 1},
+                      "lints": {
+                          "clippy::collapsible_if": 1,
+                          "dead_code": 1,
+                          "unused_imports": 1,
+                      },
+                  },
+                  "regression+stale",
+              )
+
+          @segment()
+          def evaluate(items):
+              for name, current, expected in items:
+                  regressions, stale = gate.compare(current, baseline)
+                  got = (
+                      "regression+stale"
+                      if regressions and stale
+                      else "regression"
+                      if regressions
+                      else "stale"
+                      if stale
+                      else "pass"
+                  )
+                  yield (name, expected, got)
+
+          results = list((scenarios() | evaluate())())
+          for name, expected, got in results:
+              print(f"{name}: expected={expected} got={got}")
+          assert all(expected == got for _, expected, got in results), results
+          print(f"TalkPipe container validation passed: {len(results)} scenarios")
+          PY
