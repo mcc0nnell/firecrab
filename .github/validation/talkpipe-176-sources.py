@@ -45,11 +45,26 @@ def pkg(name, source):
     }
 
 
+def rpm_key(name="gpg-pubkey"):
+    return {
+        "binaryPackage": name,
+        "binaryVersion": "0:350d275d-627e00a1",
+        "architecture": "x86_64",
+        "declaredLicense": "pubkey",
+        "sourceDisposition": "rpm-key-metadata",
+    }
+
+
 ALPINE = {
     "type": "alpine-aports",
     "sourcePackage": "busybox",
     "sourceVersion": "1.37.0-r31",
     "repositoryCommit": "1" * 40,
+}
+ROCKY = {
+    "type": "rocky-source-rpm",
+    "sourceArtifact": "bash-5.1.8-9.el9.src.rpm",
+    "sourceVersion": "0:5.1.8-9.el9",
 }
 
 SCENARIOS = [
@@ -59,6 +74,8 @@ SCENARIOS = [
     {"name": "wrong-resolver", "expected": "reject", "kind": "wrong-resolver"},
     {"name": "empty-source-unit", "expected": "reject", "kind": "empty-source"},
     {"name": "coverage-gap", "expected": "reject", "kind": "coverage-gap"},
+    {"name": "rpm-key-metadata", "expected": "pass", "kind": "rpm-key"},
+    {"name": "fake-rpm-exemption", "expected": "reject", "kind": "fake-exemption"},
     {"name": "deterministic-order", "expected": "pass", "kind": "deterministic"},
 ]
 
@@ -76,13 +93,20 @@ def exercise(items):
         try:
             source = dict(ALPINE)
             packages = [pkg("busybox", source)]
+            distribution = "alpine"
             if case["kind"] == "dedupe":
                 packages.append(pkg("busybox-binsh", dict(source)))
             elif case["kind"] == "missing-commit":
                 source.pop("repositoryCommit")
             elif case["kind"] == "wrong-resolver":
                 source["type"] = "ubuntu-source-package"
-            plan = sourcepub.publication_plan(smap("alpine", packages))
+            elif case["kind"] == "rpm-key":
+                distribution = "rocky"
+                packages = [pkg("bash", dict(ROCKY)), rpm_key()]
+            elif case["kind"] == "fake-exemption":
+                distribution = "rocky"
+                packages = [rpm_key("bash")]
+            plan = sourcepub.publication_plan(smap(distribution, packages))
 
             if case["kind"] in {"empty-source", "coverage-gap"}:
                 with tempfile.TemporaryDirectory() as tmpdir:
@@ -96,8 +120,11 @@ def exercise(items):
                         (unit / "source.tar.gz").write_bytes(b"source")
                         plan["packageCount"] += 1
                     sourcepub.source_index(plan, root)
+            elif case["kind"] == "rpm-key":
+                if plan["nonSourcePackageCount"] != 1 or plan["sourceBackedPackageCount"] != 1:
+                    raise ValueError("RPM key metadata was not explicitly accounted for")
             elif case["kind"] == "deterministic":
-                second = sourcepub.publication_plan(smap("alpine", list(reversed(packages))))
+                second = sourcepub.publication_plan(smap(distribution, list(reversed(packages))))
                 if json.dumps(plan, sort_keys=True) != json.dumps(second, sort_keys=True):
                     raise ValueError("publication plan changed with input order")
             elif case["kind"] == "dedupe" and plan["sourceCount"] != 1:
