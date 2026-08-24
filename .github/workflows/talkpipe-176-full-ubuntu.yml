@@ -32,11 +32,11 @@ jobs:
           ZSTD_THREADS: '2'
         run: scripts/build-m2images.sh --alias ubuntu-26.04 --arch x86_64
 
-      - name: Materialize all exact Ubuntu source units with one apt index
+      - name: Materialize all exact Ubuntu source units through release code
         run: |
-          python3 .github/validation/materialize-ubuntu-sources.py \
-            images/compliance/ubuntu-26.04-x86_64/source-publication-plan.json \
-            full-ubuntu-source
+          python3 scripts/fetch_m2image_sources.py \
+            --plan images/compliance/ubuntu-26.04-x86_64/source-publication-plan.json \
+            --output-dir full-ubuntu-source
 
       - name: Package full corresponding-source archive
         env:
@@ -59,13 +59,19 @@ jobs:
           import json, sys
           plan = json.load(open(sys.argv[1], encoding='utf-8'))
           index = json.load(open(sys.argv[2], encoding='utf-8'))
-          assert index['coveragePolicy'] == 'all-installed-packages'
-          assert index['packageCount'] == plan['packageCount']
-          assert index['sourceBackedPackageCount'] == plan['sourceBackedPackageCount']
-          assert index['nonSourcePackageCount'] == plan['nonSourcePackageCount']
-          assert index['sourceCount'] == plan['sourceCount']
-          assert index['fileCount'] >= index['sourceCount'] > 0
+          assert index['coveragePolicy'] == plan['coveragePolicy'] == 'all-installed-packages'
+          for field in (
+              'packageCount',
+              'sourceBackedPackageCount',
+              'nonSourcePackageCount',
+              'sourceCount',
+          ):
+              assert index[field] == plan[field]
+          assert index['sourceCount'] == len(index['sources']) == len(plan['sources']) > 0
+          assert index['fileCount'] == sum(len(item['files']) for item in index['sources'])
+          assert index['fileCount'] >= index['sourceCount']
           assert all(item['files'] for item in index['sources'])
+          assert index['nonSourcePackages'] == plan['nonSourcePackages']
           print(
               'full Ubuntu exact-source archive:',
               f"packages={index['packageCount']}",
