@@ -243,123 +243,84 @@ class FireCrabExecutor:
 
 mcp = MCPServer(
     "FireCrab",
-    version="0.2.0",
+    version="0.2.1",
     instructions=(
         "Explicit FireCrab management and Jenkins-shaped build tools backed "
         "by the native API and executed through TalkPipe. Reads are enabled "
         "by default. VM lifecycle and build mutation tools require "
         "FIRECRAB_MCP_ALLOW_MUTATIONS=1. Build runner template, network, and "
-        "resource sizing are operator configuration. Destructive VM deletion "
-        "is not exposed."
+        "resource sizing are operator configuration. Source-bound builds accept "
+        "only a trusted Gitflare source lease and verify the exact Git object "
+        "inside the guest before execution. Destructive VM deletion is not exposed."
     ),
 )
 
 
-@mcp.tool(
-    title="FireCrab status",
-    annotations=_READ_ONLY_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="FireCrab status", annotations=_READ_ONLY_TOOL, structured_output=True)
 def getStatus() -> dict[str, Any]:
     """Get FireCrab host health/readiness information."""
     return _executor.execute("GET", "/api/host")
 
 
-@mcp.tool(
-    title="List FireCrab VMs",
-    annotations=_READ_ONLY_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="List FireCrab VMs", annotations=_READ_ONLY_TOOL, structured_output=True)
 def listVMs() -> dict[str, Any]:
     """List FireCrab virtual machines."""
     return _executor.execute("GET", "/api/vms")
 
 
-@mcp.tool(
-    title="Get FireCrab VM",
-    annotations=_READ_ONLY_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="Get FireCrab VM", annotations=_READ_ONLY_TOOL, structured_output=True)
 def getVM(vmId: str) -> dict[str, Any]:
     """Get one FireCrab virtual machine by ID."""
     return _executor.execute("GET", f"/api/vms/{_id_segment(vmId)}")
 
 
-@mcp.tool(
-    title="Create FireCrab VM",
-    annotations=_MUTATING_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="Create FireCrab VM", annotations=_MUTATING_TOOL, structured_output=True)
 def createVM(spec: dict[str, Any]) -> dict[str, Any]:
     """Create a FireCrab VM. Requires the mutation policy opt-in."""
     return _executor.execute("POST", "/api/vms", spec)
 
 
-@mcp.tool(
-    title="Start FireCrab VM",
-    annotations=_MUTATING_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="Start FireCrab VM", annotations=_MUTATING_TOOL, structured_output=True)
 def startVM(vmId: str) -> dict[str, Any]:
     """Start a FireCrab virtual machine. Requires the mutation policy opt-in."""
     return _executor.execute("POST", f"/api/vms/{_id_segment(vmId)}/start")
 
 
-@mcp.tool(
-    title="Stop FireCrab VM",
-    annotations=_MUTATING_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="Stop FireCrab VM", annotations=_MUTATING_TOOL, structured_output=True)
 def stopVM(vmId: str) -> dict[str, Any]:
     """Stop a FireCrab virtual machine. Requires the mutation policy opt-in."""
     return _executor.execute("POST", f"/api/vms/{_id_segment(vmId)}/stop")
 
 
-@mcp.tool(
-    title="Read FireCrab VM log",
-    annotations=_READ_ONLY_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="Read FireCrab VM log", annotations=_READ_ONLY_TOOL, structured_output=True)
 def getVMLog(vmId: str) -> dict[str, Any]:
     """Read the FireCrab log for one virtual machine."""
     return _executor.execute("GET", f"/api/vms/{_id_segment(vmId)}/log")
 
 
-@mcp.tool(
-    title="Trigger FireCrab build",
-    annotations=_MUTATING_TOOL,
-    structured_output=True,
-)
-def triggerBuild(label: str, command: str) -> dict[str, Any]:
-    """Start a shell-backed FireCrab build using operator-owned runner capacity."""
-    return _builds.trigger_build(label, command)
+@mcp.tool(title="Trigger FireCrab build", annotations=_MUTATING_TOOL, structured_output=True)
+def triggerBuild(
+    label: str,
+    command: str,
+    source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Start a FireCrab build, optionally bound to a trusted Gitflare source lease."""
+    return _builds.trigger_build(label, command, source)
 
 
-@mcp.tool(
-    title="Get FireCrab build",
-    annotations=_READ_ONLY_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="Get FireCrab build", annotations=_READ_ONLY_TOOL, structured_output=True)
 def getBuild(buildId: str) -> dict[str, Any]:
     """Get lifecycle and conclusion information for one FireCrab build."""
     return _builds.get_build(buildId)
 
 
-@mcp.tool(
-    title="Read FireCrab build log",
-    annotations=_READ_ONLY_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="Read FireCrab build log", annotations=_READ_ONLY_TOOL, structured_output=True)
 def getBuildLog(buildId: str) -> dict[str, Any]:
     """Read command output for one FireCrab build from its serial evidence."""
     return _builds.get_build_log(buildId)
 
 
-@mcp.tool(
-    title="Stop FireCrab build",
-    annotations=_DESTRUCTIVE_TOOL,
-    structured_output=True,
-)
+@mcp.tool(title="Stop FireCrab build", annotations=_DESTRUCTIVE_TOOL, structured_output=True)
 def stopBuild(buildId: str) -> dict[str, Any]:
     """Stop a FireCrab build VM after verifying that it belongs to the build layer."""
     return _builds.stop_build(buildId)
@@ -376,17 +337,11 @@ def _normalize_base_url(value: str) -> str:
     value = value.rstrip("/")
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise FireCrabMcpError(
-            "FIRECRAB_API_URL must be an absolute http(s) URL"
-        )
+        raise FireCrabMcpError("FIRECRAB_API_URL must be an absolute http(s) URL")
     if parsed.username is not None or parsed.password is not None:
-        raise FireCrabMcpError(
-            "FIRECRAB_API_URL must not embed credentials"
-        )
+        raise FireCrabMcpError("FIRECRAB_API_URL must not embed credentials")
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
-        raise FireCrabMcpError(
-            "FIRECRAB_API_URL must not include a path, query, or fragment"
-        )
+        raise FireCrabMcpError("FIRECRAB_API_URL must not include a path, query, or fragment")
     return value
 
 
@@ -420,10 +375,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("stdio", "streamable-http"),
         default=os.getenv("FIRECRAB_MCP_TRANSPORT", "stdio"),
     )
-    parser.add_argument(
-        "--host",
-        default=os.getenv("FIRECRAB_MCP_HOST", "127.0.0.1"),
-    )
+    parser.add_argument("--host", default=os.getenv("FIRECRAB_MCP_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port",
         type=int,
@@ -438,12 +390,8 @@ def main() -> None:
         mcp.run()
         return
 
-    # Unlike Jenkins, this MVP does not yet inherit an authenticated controller
-    # session. Keep the HTTP transport local until MCP-side auth is wired.
     if args.host not in _LOOPBACK_HOSTS:
-        raise SystemExit(
-            "refusing non-loopback MCP bind before MCP authentication is configured"
-        )
+        raise SystemExit("refusing non-loopback MCP bind before MCP authentication is configured")
     mcp.run(
         transport="streamable-http",
         host=args.host,
@@ -453,8 +401,6 @@ def main() -> None:
     )
 
 
-# Environment-dependent executor creation stays after helper definitions so
-# invalid operator configuration fails with the intended FireCrabMcpError.
 _executor = FireCrabExecutor()
 _builds = FireCrabBuildExecutor(_executor)
 
