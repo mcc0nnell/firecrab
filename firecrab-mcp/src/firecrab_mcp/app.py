@@ -11,23 +11,33 @@ from .gitflare_source import GitflareSourceAuthority
 from .server import _executor, main as _base_main, mcp
 
 _MUTATING_TOOL = ToolAnnotations(read_only_hint=False, destructive_hint=False)
-_gitflare_builds = GitflareBuildExecutor(
-    _executor,
-    GitflareSourceAuthority(),
-    FireCrabRunnerProfile.from_env(),
-)
+
+
+def _gitflare_build_executor() -> GitflareBuildExecutor:
+    # Resolve optional Gitflare credentials only when these tools are invoked so
+    # ordinary FireCrab MCP reads/builds remain available without Gitflare.
+    return GitflareBuildExecutor(
+        _executor,
+        GitflareSourceAuthority(),
+        FireCrabRunnerProfile.from_env(),
+    )
 
 
 @mcp.tool(title="Trigger Gitflare FireCrab build", annotations=_MUTATING_TOOL, structured_output=True)
 def triggerGitflareBuild(label: str, repo: str, sha: str, command: str) -> dict[str, Any]:
     """Build one exact Gitflare revision in a fresh FireCrab guest."""
-    return _gitflare_builds.trigger_build(label=label, repo=repo, sha=sha, command=command)
+    return _gitflare_build_executor().trigger_build(
+        label=label,
+        repo=repo,
+        sha=sha,
+        command=command,
+    )
 
 
 @mcp.tool(title="Trigger FireCrab host assurance", annotations=_MUTATING_TOOL, structured_output=True)
 def triggerAssuranceBuild(repo: str, sha: str) -> dict[str, Any]:
     """Run the fixed FireCrab v1 host assurance adapter at one exact Gitflare SHA."""
-    return _gitflare_builds.trigger_host_assurance(repo=repo, sha=sha)
+    return _gitflare_build_executor().trigger_host_assurance(repo=repo, sha=sha)
 
 
 def main() -> None:
