@@ -3,6 +3,8 @@ pub mod builder_vm;
 pub mod console;
 pub mod console_sentinel;
 pub mod images;
+#[cfg(test)]
+mod images_local_tests;
 pub mod micro_networks;
 pub mod micro_storages;
 pub mod microregistry;
