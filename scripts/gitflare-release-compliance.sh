@@ -156,6 +156,12 @@ with open(path, "w", encoding="utf-8") as stream:
     stream.write("\n")
 PY
 
+# This is the TalkPipe/external-CI handoff. The project owns the matrix; the
+# orchestrator consumes a typed job plan rather than hard-coding FireCrab policy.
+python3 scripts/assurance_plan.py \
+    --sha "$ACTUAL_SHA" \
+    --output "$RECEIPTS/assurance-plan.json"
+
 printf '\n== compliance + assurance unit contracts (Python optimization enabled) ==\n'
 python3 -m unittest \
     scripts/test_release_compliance.py \
@@ -164,6 +170,7 @@ python3 -m unittest \
     scripts/test_m2image_source_publication.py \
     scripts/test_fetch_m2image_sources.py \
     scripts/test_assemble_assurance.py
+python3 -m py_compile scripts/assurance_plan.py scripts/assemble_assurance.py
 
 printf '\n== shell and M2Image publication contracts ==\n'
 shellcheck \
