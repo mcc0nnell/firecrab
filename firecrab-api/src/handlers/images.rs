@@ -1,16 +1,22 @@
 //! `GET /api/images` catalog, package acquisition, image installation, and delete.
 
+use std::fs::File;
+use std::io::Read;
+use std::path::Path as FsPath;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use firecrab_api_types::{ImageInstallResponse, ImageInstallStatus, ImageResponse, PackageOrigin};
+use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::image_install;
+use crate::persistence::LocalCatalogEntry;
 use crate::server::RequestId;
 use crate::state::AppState;
-use crate::templates::{TemplateRegistry, TemplateVersion};
+use crate::templates::{TemplateRegistry, TemplateSpec, TemplateVersion};
 
 /// Smallest disk (GiB) that can hold `rootfs_bytes`, matching create validation.
 fn min_disk_gb_for(rootfs_bytes: u64) -> u16 {
@@ -222,6 +228,118 @@ pub async fn start_image_package(
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
+async fn host_local_catalog_entry(
+    state: &AppState,
+    alias: &str,
+    request_id: RequestId,
+) -> Result<Option<LocalCatalogEntry>, AppError> {
+    let store = state.store.clone();
+    let alias = alias.to_owned();
+    let request_id = request_id.0;
+    tokio::task::spawn_blocking(move || {
+        store.microregistry_local(&alias, image_install::host_architecture())
+    })
+    .await
+    .map_err(|_| AppError::internal(request_id))?
+    .map_err(|error| {
+        tracing::error!(request_id = %request_id, %error, "failed to read local MicroRegistry row");
+        AppError::internal(request_id)
+    })
+}
+
+fn sha256_file(path: &FsPath) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn local_package_spec_blocking(
+    archive: &FsPath,
+    entry: &LocalCatalogEntry,
+) -> Result<TemplateSpec, String> {
+    let expected_package = image_install::package_name(&entry.alias);
+    if entry.package != expected_package {
+        return Err(format!(
+            "local MicroRegistry package mismatch for {}: expected {}, got {}",
+            entry.alias, expected_package, entry.package
+        ));
+    }
+    if entry.sha256.is_empty() {
+        return Err(format!(
+            "local MicroRegistry row for {} is missing package sha256",
+            entry.alias
+        ));
+    }
+
+    let actual_sha256 = sha256_file(archive)?;
+    if !actual_sha256.eq_ignore_ascii_case(&entry.sha256) {
+        return Err(format!(
+            "staged package checksum mismatch for {}: expected {}, got {}",
+            entry.alias, entry.sha256, actual_sha256
+        ));
+    }
+
+    let file =
+        File::open(archive).map_err(|error| format!("open {}: {error}", archive.display()))?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| format!("zstd decoder {}: {error}", archive.display()))?;
+    let mut tar = tar::Archive::new(decoder);
+    for archive_entry in tar
+        .entries()
+        .map_err(|error| format!("tar entries: {error}"))?
+    {
+        let mut archive_entry = archive_entry.map_err(|error| format!("tar entry: {error}"))?;
+        let name = archive_entry
+            .path()
+            .map_err(|error| format!("tar member path: {error}"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if name != crate::package::TEMPLATE_SPEC_MEMBER {
+            continue;
+        }
+        let spec: TemplateSpec = serde_json::from_reader(&mut archive_entry)
+            .map_err(|error| format!("parse {}: {error}", crate::package::TEMPLATE_SPEC_MEMBER))?;
+        if spec.alias != entry.alias {
+            return Err(format!(
+                "local package alias mismatch: catalog has {}, package has {}",
+                entry.alias, spec.alias
+            ));
+        }
+        if spec.version != entry.version {
+            return Err(format!(
+                "local package version mismatch for {}: catalog has {}, package has {}",
+                entry.alias, entry.version, spec.version
+            ));
+        }
+        return Ok(spec);
+    }
+
+    Err(format!(
+        "archive missing required member `{}`",
+        crate::package::TEMPLATE_SPEC_MEMBER
+    ))
+}
+
+async fn local_package_spec(
+    image_root: std::path::PathBuf,
+    entry: LocalCatalogEntry,
+) -> Result<TemplateSpec, String> {
+    let archive = image_install::staged_package_path(&image_root, &entry.alias);
+    tokio::task::spawn_blocking(move || local_package_spec_blocking(&archive, &entry))
+        .await
+        .map_err(|error| format!("local package validation task panicked: {error}"))?
+}
+
 /// `GET /api/images/{alias}/install` — latest image installation snapshot.
 pub async fn get_image_install(
     State(state): State<AppState>,
@@ -230,6 +348,9 @@ pub async fn get_image_install(
 ) -> Result<Json<ImageInstallResponse>, AppError> {
     if TemplateRegistry::known_spec(&alias).is_none()
         && state.templates.resolve_alias(&alias).is_none()
+        && host_local_catalog_entry(&state, &alias, request_id)
+            .await?
+            .is_none()
     {
         return Err(AppError::not_found(request_id.0));
     }
@@ -243,9 +364,15 @@ pub async fn start_image_install(
     Path(alias): Path<String>,
     Extension(request_id): Extension<RequestId>,
 ) -> Result<impl IntoResponse, AppError> {
-    let Some(spec) = TemplateRegistry::known_spec(&alias) else {
-        return Err(AppError::not_found(request_id.0));
+    let public_spec = TemplateRegistry::known_spec(&alias);
+    let local_entry = if public_spec.is_none() {
+        host_local_catalog_entry(&state, &alias, request_id).await?
+    } else {
+        None
     };
+    if public_spec.is_none() && local_entry.is_none() {
+        return Err(AppError::not_found(request_id.0));
+    }
 
     if state.templates.resolve_alias(&alias).is_some() {
         return Err(AppError::conflict(
@@ -285,9 +412,27 @@ pub async fn start_image_install(
 
     let tracker = state.image_installs.clone();
     let templates = (*state.templates).clone();
-    tokio::spawn(async move {
-        image_install::run_image_install(tracker, templates, spec).await;
-    });
+    if let Some(spec) = public_spec {
+        tokio::spawn(async move {
+            image_install::run_image_install(tracker, templates, spec).await;
+        });
+    } else {
+        let entry = local_entry.expect("local entry checked above");
+        let image_root = templates.image_root_path().to_path_buf();
+        let alias_for_job = alias.clone();
+        tokio::spawn(async move {
+            match local_package_spec(image_root, entry).await {
+                Ok(spec) => {
+                    tracker.append_log(
+                        &alias_for_job,
+                        "local MicroRegistry package checksum verified",
+                    );
+                    image_install::run_image_install(tracker, templates, spec).await;
+                }
+                Err(error) => tracker.finish_err(&alias_for_job, error),
+            }
+        });
+    }
 
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
