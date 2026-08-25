@@ -44,6 +44,7 @@ status=FAIL
 reason='execution failed'
 binary_members=''
 source_members=''
+mount_probe=''
 
 write_result() {
   rc=$1
@@ -112,6 +113,7 @@ finish() {
   trap - EXIT
   [ -z "$binary_members" ] || rm -f -- "$binary_members"
   [ -z "$source_members" ] || rm -f -- "$source_members"
+  [ -z "$mount_probe" ] || rmdir -- "$mount_probe" 2>/dev/null || true
   write_result "$rc" || true
   exit "$rc"
 }
@@ -131,6 +133,10 @@ fail() {
   exit 1
 }
 
+require_lab_command() {
+  command -v "$1" >/dev/null 2>&1 || block "required native-lab command not found: $1"
+}
+
 normalize_arch() {
   case "$1" in
     x86_64|amd64) printf '%s\n' x86_64 ;;
@@ -139,17 +145,34 @@ normalize_arch() {
   esac
 }
 
-for command in git python3 curl tar zstd sha256sum chroot mount umount mkfs.ext4 debugfs; do
-  command -v "$command" >/dev/null 2>&1 || block "required native-lab command not found: $command"
+for command in \
+  git python3 curl tar zstd sha256sum chroot mount umount mkfs.ext4 debugfs \
+  awk cp file find grep install mkdir mv od rm sort tail truncate uname wc; do
+  require_lab_command "$command"
 done
 
 host_arch=$(normalize_arch "$(uname -m)")
 [ "$host_arch" = "$architecture" ] || block "requires native $architecture runner; current host is $host_arch"
 
+priv=()
 if [ "$(id -u)" -ne 0 ]; then
-  command -v sudo >/dev/null 2>&1 || block 'native M2Image build requires root or passwordless sudo'
+  require_lab_command sudo
   sudo -n true >/dev/null 2>&1 || block 'native M2Image build requires passwordless sudo on the disposable lab runner'
+  priv=(sudo -n)
 fi
+
+# Root inside a restricted container is not enough: the builders bind-mount
+# proc/sys/dev/run into a chroot. Prove mount capability before classifying any
+# later builder error as a FireCrab failure.
+mount_probe=$(mktemp -d)
+if ! "${priv[@]}" mount -t tmpfs -o size=1m tmpfs "$mount_probe" >/dev/null 2>&1; then
+  block 'native M2Image build requires mount capability (CAP_SYS_ADMIN or equivalent)'
+fi
+if ! "${priv[@]}" umount "$mount_probe" >/dev/null 2>&1; then
+  block 'native M2Image runner could mount but could not unmount the capability probe'
+fi
+rmdir -- "$mount_probe"
+mount_probe=''
 
 if [ -n "$expected_sha" ] && [ "${actual_sha,,}" != "${expected_sha,,}" ]; then
   fail "checkout SHA mismatch: expected $expected_sha, got $actual_sha"
@@ -158,6 +181,28 @@ fi
 python3 "$ROOT/scripts/m2image-manifest.py" --manifest "$manifest" validate >/dev/null
 python3 "$ROOT/scripts/m2image-manifest.py" --manifest "$manifest" registry-key "$alias_name" "$architecture" >/dev/null \
   || fail "alias/architecture is not manifest-backed: $alias_name/$architecture"
+distribution=$(python3 "$ROOT/scripts/m2image-manifest.py" --manifest "$manifest" field "$alias_name" distribution) \
+  || fail "could not resolve distribution for $alias_name"
+
+# Distribution-specific build/source tooling is a runner capability. Missing it
+# is BLOCKED, not evidence that FireCrab's source contract failed.
+case "$distribution" in
+  alpine)
+    for command in gzip docker; do require_lab_command "$command"; done
+    docker info >/dev/null 2>&1 \
+      || block 'Alpine corresponding-source materialization requires access to a Docker daemon'
+    ;;
+  ubuntu)
+    require_lab_command apt-get
+    ;;
+  rocky)
+    require_lab_command jq
+    require_lab_command xz
+    ;;
+  *)
+    fail "unsupported M2Image distribution in manifest: $distribution"
+    ;;
+esac
 
 # Assert the source boundary before creating any evidence or generated state.
 if [ -n "$(git status --porcelain=v1 --untracked-files=all)" ]; then
