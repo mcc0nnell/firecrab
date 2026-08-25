@@ -156,13 +156,14 @@ with open(path, "w", encoding="utf-8") as stream:
     stream.write("\n")
 PY
 
-printf '\n== compliance unit contracts (Python optimization enabled) ==\n'
+printf '\n== compliance + assurance unit contracts (Python optimization enabled) ==\n'
 python3 -m unittest \
     scripts/test_release_compliance.py \
     scripts/test_m2image_sbom.py \
     scripts/test_m2image_compliance.py \
     scripts/test_m2image_source_publication.py \
-    scripts/test_fetch_m2image_sources.py
+    scripts/test_fetch_m2image_sources.py \
+    scripts/test_assemble_assurance.py
 
 printf '\n== shell and M2Image publication contracts ==\n'
 shellcheck \
@@ -173,7 +174,9 @@ shellcheck \
     scripts/test-m2image-package-compliance.sh \
     scripts/test-m2image-source-package.sh \
     scripts/test-m2image-source-publish.sh \
-    scripts/gitflare-release-compliance.sh
+    scripts/gitflare-release-compliance.sh \
+    scripts/gitflare-m2image-assurance.sh \
+    scripts/gitflare-host-assurance.sh
 bash scripts/test-m2image-package-compliance.sh
 bash scripts/test-m2image-source-package.sh
 bash scripts/test-m2image-source-publish.sh
