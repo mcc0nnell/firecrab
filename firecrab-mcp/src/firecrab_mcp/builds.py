@@ -6,15 +6,18 @@ writes deterministic FIRECRAB_SHELL_* markers to the serial console. This
 module turns that native lifecycle into build/inspect/log/stop semantics without
 teaching MCP callers anything about Firecracker internals.
 
-This first slice retains the VM and shell as build evidence. Retention/garbage
-collection is intentionally separate from execution because deletion is not yet
-part of the MCP capability surface.
+Source-bound builds accept only a short-lived, read-only Gitflare source lease
+issued by the trusted control plane. The guest checks out and independently
+verifies the exact Git object before the requested build command is allowed to
+run. The lease token is placed in VM environment, never interpolated into shell
+source or returned as build evidence.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -22,6 +25,9 @@ from typing import Any, Protocol
 _BUILD_PREFIX = "ci-"
 _MAX_COMMAND_BYTES = 28 * 1024
 _MAX_LABEL_BYTES = 160
+_MAX_SOURCE_TOKEN_BYTES = 4096
+_GIT_OBJECT_RE = re.compile(r"^[a-f0-9]{40}(?:[a-f0-9]{24})?$", re.I)
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 _TERMINAL_RE = re.compile(r"^FIRECRAB_SHELL_(OK|FAILED) 00\.sh(?: (\d+))?$", re.MULTILINE)
 _DONE_RE = re.compile(r"^FIRECRAB_SHELL_DONE (ok|failed)$", re.MULTILINE)
 _START_RE = re.compile(r"^FIRECRAB_SHELL_START 00\.sh[^\n]*$", re.MULTILINE)
@@ -43,13 +49,85 @@ class Executor(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class FireCrabRunnerProfile:
-    """Operator-owned FireCrab capacity used for MCP builds.
+class BuildSource:
+    """A least-privilege Gitflare lease for one exact source object."""
 
-    Infrastructure placement is configuration, not a model/tool argument. This
-    mirrors Jenkins agents/labels: a build asks to run, while the controller
-    decides what execution capacity that means.
-    """
+    remote: str
+    token: str
+    sha: str
+    ref: str
+    repo: str
+
+    @classmethod
+    def parse(cls, value: dict[str, Any]) -> "BuildSource":
+        expected = {"schemaVersion", "provider", "namespace", "repo", "sha", "ref", "remote", "token"}
+        if set(value) != expected:
+            raise FireCrabBuildError("build source has unexpected or missing fields")
+        if value.get("schemaVersion") != 1:
+            raise FireCrabBuildError("build source schemaVersion must equal 1")
+        if value.get("provider") != "cloudflare-artifacts" or value.get("namespace") != "gitflare":
+            raise FireCrabBuildError("build source provider/namespace is not admitted")
+
+        repo = value.get("repo")
+        sha = value.get("sha")
+        ref = value.get("ref")
+        remote = value.get("remote")
+        token = value.get("token")
+        if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
+            raise FireCrabBuildError("build source repo is invalid")
+        if not isinstance(sha, str) or not _GIT_OBJECT_RE.fullmatch(sha):
+            raise FireCrabBuildError("build source sha must be a Git object id")
+        if (
+            not isinstance(ref, str)
+            or not (ref.startswith("refs/heads/") or ref.startswith("refs/tags/"))
+            or any(ord(char) < 32 or ord(char) == 127 for char in ref)
+        ):
+            raise FireCrabBuildError("build source ref must be a printable heads or tags ref")
+        if not isinstance(remote, str):
+            raise FireCrabBuildError("build source remote must be a URL")
+        parsed = urllib.parse.urlsplit(remote)
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or not parsed.hostname
+            or not parsed.hostname.endswith(".artifacts.cloudflare.net")
+            or parsed.path != f"/git/gitflare/{repo}.git"
+        ):
+            raise FireCrabBuildError("build source remote is outside the admitted Gitflare namespace")
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token.encode("utf-8")) > _MAX_SOURCE_TOKEN_BYTES
+            or any(ord(char) < 32 or ord(char) == 127 for char in token)
+        ):
+            raise FireCrabBuildError("build source token is invalid")
+        return cls(remote=remote, token=token, sha=sha.lower(), ref=ref, repo=repo)
+
+    def environment(self) -> dict[str, str]:
+        return {
+            "GITFLARE_SOURCE_REMOTE": self.remote,
+            "GITFLARE_SOURCE_TOKEN": self.token,
+            "GITFLARE_SOURCE_SHA": self.sha,
+            "GITFLARE_SOURCE_REF": self.ref,
+        }
+
+    def evidence(self) -> dict[str, str]:
+        return {
+            "provider": "cloudflare-artifacts",
+            "namespace": "gitflare",
+            "repo": self.repo,
+            "sha": self.sha,
+            "ref": self.ref,
+            "remote": self.remote,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FireCrabRunnerProfile:
+    """Operator-owned FireCrab capacity used for MCP builds."""
 
     template: str | None
     micro_network_id: str | None
@@ -106,11 +184,17 @@ class FireCrabBuildExecutor:
         self.executor = executor
         self.profile = profile or FireCrabRunnerProfile.from_env()
 
-    def trigger_build(self, label: str, command: str) -> dict[str, Any]:
+    def trigger_build(
+        self,
+        label: str,
+        command: str,
+        source: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Create one shell-backed VM and start it asynchronously."""
         self.profile.validate()
         label = _validate_label(label)
         command = _validate_command(command)
+        source_lease = BuildSource.parse(source) if source is not None else None
         build_name = _build_name(label)
 
         shell = self.executor.execute(
@@ -119,7 +203,7 @@ class FireCrabBuildExecutor:
             {
                 "name": build_name,
                 "description": f"FireCrab MCP build shell for {label}",
-                "content": _build_script(command),
+                "content": _build_script(command, source_bound=source_lease is not None),
             },
         )
         shell_data = _mapping_data(shell, "create shell")
@@ -135,7 +219,7 @@ class FireCrabBuildExecutor:
             "microNetworkId": self.profile.micro_network_id,
             "shellIds": [shell_id],
             "portForwards": [],
-            "env": {},
+            "env": source_lease.environment() if source_lease is not None else {},
         }
         if self.profile.storage_root:
             vm_body["storageRoot"] = self.profile.storage_root
@@ -154,6 +238,7 @@ class FireCrabBuildExecutor:
             "vmName": build_name,
             "shellId": shell_id,
             "phase": _phase_for_vm_state(str(started_data.get("state", "starting"))),
+            **({"source": source_lease.evidence()} if source_lease is not None else {}),
             "requestIds": {
                 "shell": shell.get("requestId"),
                 "create": created.get("requestId"),
@@ -252,13 +337,7 @@ class ParsedBuildConsole:
 
 
 def parse_build_console(console: str) -> ParsedBuildConsole:
-    """Parse the final FireCrab shell protocol markers from a serial log.
-
-    The shell runner emits its terminal marker after the user script has
-    finished, then emits FIRECRAB_SHELL_DONE. We deliberately use the final
-    occurrences so normal command output that happens to contain marker-like
-    text cannot win over the runner's own final protocol line.
-    """
+    """Parse the final FireCrab shell protocol markers from a serial log."""
     terminals = list(_TERMINAL_RE.finditer(console))
     dones = list(_DONE_RE.finditer(console))
     if not terminals or not dones:
@@ -305,13 +384,30 @@ def _phase_for_vm_state(state: str) -> str:
     }.get(state, "unknown")
 
 
-def _build_script(command: str) -> str:
-    return "#!/bin/sh\nset -e\nexport CI=true\n" + command.rstrip() + "\n"
+def _build_script(command: str, *, source_bound: bool = False) -> str:
+    header = "#!/bin/sh\nset -eu\nexport CI=true\n"
+    if not source_bound:
+        return header + command.rstrip() + "\n"
+    bootstrap = r'''command -v git >/dev/null 2>&1 || { echo "git is required for source-bound builds" >&2; exit 69; }
+umask 077
+rm -rf /workspace/source
+mkdir -p /workspace/source
+cd /workspace/source
+git init -q
+git remote add origin "$GITFLARE_SOURCE_REMOTE"
+if ! git -c http.extraHeader="Authorization: Bearer $GITFLARE_SOURCE_TOKEN" fetch --no-tags origin "$GITFLARE_SOURCE_SHA"; then
+  git -c http.extraHeader="Authorization: Bearer $GITFLARE_SOURCE_TOKEN" fetch --no-tags origin "$GITFLARE_SOURCE_REF"
+fi
+git cat-file -e "${GITFLARE_SOURCE_SHA}^{commit}"
+git checkout --detach -q "$GITFLARE_SOURCE_SHA"
+test "$(git rev-parse HEAD)" = "$GITFLARE_SOURCE_SHA"
+unset GITFLARE_SOURCE_TOKEN
+'''
+    return header + bootstrap + command.rstrip() + "\n"
 
 
 def _build_name(label: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-._").lower() or "build"
-    # FireCrab VM and shell names are capped at 64 safe characters.
     suffix = uuid.uuid4().hex[:10]
     room = 64 - len(_BUILD_PREFIX) - len(suffix) - 1
     return f"{_BUILD_PREFIX}{slug[:room]}-{suffix}"
