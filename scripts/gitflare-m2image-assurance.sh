@@ -39,11 +39,11 @@ case "$architecture" in x86_64|aarch64) ;; *) usage >&2; exit 2 ;; esac
 
 result_dir="$ROOT/dist/assurance/m2images/$alias_name/$architecture"
 result_json="$result_dir/result.json"
-mkdir -p "$result_dir"
-
 actual_sha=$(git rev-parse HEAD)
 status=FAIL
 reason='execution failed'
+binary_members=''
+source_members=''
 
 write_result() {
   rc=$1
@@ -83,11 +83,8 @@ def read_json(path: Path):
         return None
 
 sbom = read_json(compliance / "sbom.spdx.json") or {}
-index = None
-if source.is_file():
-    # source-index.json is inside the archive, so package/source counts are taken
-    # from the frozen compliance plan that was independently checked before pack.
-    index = read_json(compliance / "source-publication-plan.json") or {}
+plan = read_json(compliance / "source-publication-plan.json") or {}
+packages = sbom.get("packages") or []
 
 payload = {
     "schemaVersion": 1,
@@ -99,10 +96,10 @@ payload = {
     "reason": os.environ["REASON"],
     "binaryArtifact": sha256(binary),
     "sourceArtifact": sha256(source),
-    "packageCount": len(sbom.get("packages") or []) - (1 if sbom.get("packages") else 0),
-    "sourceUnitCount": index.get("sourceCount") if isinstance(index, dict) else None,
-    "sourceBackedPackageCount": index.get("sourceBackedPackageCount") if isinstance(index, dict) else None,
-    "nonSourcePackageCount": index.get("nonSourcePackageCount") if isinstance(index, dict) else None,
+    "packageCount": max(0, len(packages) - 1),
+    "sourceUnitCount": plan.get("sourceCount") if isinstance(plan, dict) else None,
+    "sourceBackedPackageCount": plan.get("sourceBackedPackageCount") if isinstance(plan, dict) else None,
+    "nonSourcePackageCount": plan.get("nonSourcePackageCount") if isinstance(plan, dict) else None,
 }
 result.parent.mkdir(parents=True, exist_ok=True)
 result.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -113,6 +110,8 @@ PY
 finish() {
   rc=$?
   trap - EXIT
+  [ -z "$binary_members" ] || rm -f -- "$binary_members"
+  [ -z "$source_members" ] || rm -f -- "$source_members"
   write_result "$rc" || true
   exit "$rc"
 }
@@ -160,11 +159,13 @@ python3 "$ROOT/scripts/m2image-manifest.py" --manifest "$manifest" validate >/de
 python3 "$ROOT/scripts/m2image-manifest.py" --manifest "$manifest" registry-key "$alias_name" "$architecture" >/dev/null \
   || fail "alias/architecture is not manifest-backed: $alias_name/$architecture"
 
-# This stage is intentionally destructive only inside a disposable checkout.
-# Refuse to inherit generated state; cached source/build output is evidence poison.
+# Assert the source boundary before creating any evidence or generated state.
 if [ -n "$(git status --porcelain=v1 --untracked-files=all)" ]; then
   fail 'source checkout is not clean before native assurance build'
 fi
+
+# This stage is intentionally destructive only inside a disposable checkout.
+# Refuse to inherit generated state; cached source/build output is evidence poison.
 rm -rf -- "$ROOT/build" "$ROOT/images/rootfs" "$ROOT/images/kernel" \
   "$ROOT/images/compliance" "$ROOT/dist/m2images"
 mkdir -p "$ROOT/images/rootfs" "$ROOT/images/kernel" "$ROOT/images/compliance"
@@ -196,7 +197,6 @@ zstd -t "$source" >/dev/null
 
 binary_members=$(mktemp)
 source_members=$(mktemp)
-trap 'rm -f -- "$binary_members" "$source_members"; finish' EXIT
 zstd -dc "$binary" | tar -tf - >"$binary_members"
 zstd -dc "$source" | tar -tf - >"$source_members"
 for required in compliance/sbom.spdx.json compliance/source-map.json compliance/source-publication-plan.json; do
