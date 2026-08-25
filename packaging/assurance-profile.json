@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "profile": "firecrab-release-assurance-v1",
+  "subject": {
+    "m2imageManifest": "packaging/m2images.json",
+    "sourceRevision": "git-head"
+  },
+  "verdicts": ["PASS", "FAIL", "BLOCKED"],
+  "stages": [
+    {
+      "id": "release-compliance-preflight",
+      "runnerClass": "sandbox",
+      "required": true,
+      "command": "bash scripts/gitflare-release-compliance.sh",
+      "evidence": "dist/gitflare-receipts/verdict.json"
+    },
+    {
+      "id": "m2image-source-assurance",
+      "runnerClass": "native-root",
+      "required": true,
+      "matrix": {
+        "aliasesFrom": "packaging/m2images.json#/images/*/alias",
+        "architecturesFrom": "packaging/m2images.json#/architectures"
+      },
+      "command": "bash scripts/gitflare-m2image-assurance.sh --alias {alias} --arch {architecture}",
+      "evidence": "dist/assurance/m2images/{alias}/{architecture}/result.json"
+    },
+    {
+      "id": "host-release-assurance",
+      "runnerClass": "native",
+      "required": true,
+      "matrix": {
+        "targets": [
+          "x86_64-unknown-linux-gnu",
+          "x86_64-unknown-linux-musl",
+          "aarch64-unknown-linux-gnu",
+          "aarch64-unknown-linux-musl"
+        ]
+      },
+      "command": "bash scripts/gitflare-host-assurance.sh --target {target}",
+      "evidence": "dist/assurance/host/{target}/result.json"
+    },
+    {
+      "id": "aggregate",
+      "runnerClass": "evidence",
+      "required": true,
+      "command": "python3 scripts/assemble_assurance.py --root dist/assurance --preflight dist/gitflare-receipts/verdict.json",
+      "evidence": "dist/assurance/verdict.json"
+    }
+  ]
+}
