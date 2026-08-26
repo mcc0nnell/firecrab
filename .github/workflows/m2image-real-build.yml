@@ -1,0 +1,67 @@
+name: M2Image real-build coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m2image-real-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  real-build:
+    name: ${{ matrix.alias }} / x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        alias:
+          - alpine-3.24.1
+          - ubuntu-26.04
+          - rocky-9.8
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            bzip2 \
+            curl \
+            dpkg-dev \
+            e2fsprogs \
+            file \
+            jq \
+            lz4 \
+            lzop \
+            xz-utils \
+            zstd
+
+      - name: Build and package real M2Image
+        run: |
+          sudo -n true
+          ./scripts/build-m2images.sh \
+            --alias "${{ matrix.alias }}" \
+            --arch x86_64
+
+      - name: Materialize and package exact sources
+        env:
+          M2IMAGE_SOURCE_WORKERS: "4"
+        run: |
+          ./scripts/package-m2image-sources.sh \
+            --alias "${{ matrix.alias }}" \
+            --arch x86_64
+
+      - name: Verify package checksums
+        run: |
+          cd dist/m2images/x86_64
+          sha256sum -c SHA256SUMS
