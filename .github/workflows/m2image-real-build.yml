@@ -13,17 +13,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Plan real builds
+    runs-on: ubuntu-latest
+    outputs:
+      aliases: ${{ steps.aliases.outputs.aliases }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read manifest aliases
+        id: aliases
+        shell: bash
+        run: |
+          aliases="$(
+            python3 scripts/m2image-manifest.py --manifest packaging/m2images.json aliases |
+              python3 -c 'import json, sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))'
+          )"
+          echo "aliases=${aliases}" >> "$GITHUB_OUTPUT"
+
   real-build:
     name: ${{ matrix.alias }} / x86_64
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        alias:
-          - alpine-3.24.1
-          - ubuntu-26.04
-          - rocky-9.8
+        alias: ${{ fromJSON(needs.plan.outputs.aliases) }}
 
     steps:
       - uses: actions/checkout@v7
