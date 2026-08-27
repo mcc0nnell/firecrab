@@ -44,7 +44,8 @@ wait_for_job() {
   return 1
 }
 
-if [ "$(image_installed)" = true ]; then
+installed=$(image_installed)
+if [ "$installed" = true ]; then
   echo "M2Image already installed: $ALIAS"
   exit 0
 fi
@@ -60,7 +61,8 @@ case "$code" in
 esac
 wait_for_job "$API/api/images/$ALIAS/package" package
 
-if [ "$(image_installed)" = true ]; then
+installed=$(image_installed)
+if [ "$installed" = true ]; then
   echo "M2Image became available while package was prepared: $ALIAS"
   exit 0
 fi
@@ -72,7 +74,8 @@ case "$code" in
   409)
     # A long-lived self-hosted runner may have registered the image between
     # our checks. Accept only a real installed template, not any 409.
-    if [ "$(image_installed)" = true ]; then
+    installed=$(image_installed)
+    if [ "$installed" = true ]; then
       echo "M2Image already installed: $ALIAS"
       exit 0
     fi
@@ -83,7 +86,8 @@ case "$code" in
 esac
 wait_for_job "$API/api/images/$ALIAS/install" install
 
-test "$(image_installed)" = true || {
+installed=$(image_installed)
+test "$installed" = true || {
   echo "install reported success but $ALIAS is not registered" >&2
   exit 1
 }
