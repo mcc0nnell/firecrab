@@ -1,0 +1,88 @@
+name: M2 Repair Verification
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: m2-repair-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  vm-boot:
+    if: github.head_ref == 'fix/ci-m2image-boot'
+    name: M2 repair (${{ matrix.host }} / ${{ matrix.template }})
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        template:
+          - alpine-3.24.1
+          - ubuntu-26.04
+          - rocky-9.8
+        host:
+          - ubuntu-24.04
+          - ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.host }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.host }}-
+            cargo-${{ runner.os }}-
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: KVM is available
+        run: |
+          test -e /dev/kvm || { echo "no /dev/kvm on ${{ matrix.host }}"; exit 1; }
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
+          uname -a
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: firecrab-frontend/package-lock.json
+
+      - name: Build install payload
+        run: ./scripts/ci-prepare-install-payload.sh
+
+      - name: Install firecrab
+        run: |
+          set -euo pipefail
+          sudo -E env "PATH=$PATH" ./install.sh \
+            --bin-dir target/release \
+            --dashboard-dir firecrab-frontend/dist
+
+      - name: Install M2Image
+        run: |
+          chmod +x scripts/ci-install-m2image.sh
+          scripts/ci-install-m2image.sh "${{ matrix.template }}"
+          echo "BOOT_TEMPLATE=${{ matrix.template }}" >>"$GITHUB_ENV"
+
+      - name: Boot M2 guest
+        run: |
+          chmod +x scripts/ci-m2-guest-boot.sh
+          scripts/ci-m2-guest-boot.sh "$BOOT_TEMPLATE"
+
+      - name: Console log and journals (on failure)
+        if: failure()
+        run: |
+          sudo find /var/lib/firecrab -name 'console.log' 2>/dev/null | head -5 | while read -r f; do
+            echo "==== $f ===="
+            sudo tail -n 80 "$f" || true
+          done
+          curl -fsS http://127.0.0.1:5523/api/images || true
+          sudo journalctl -u firecrab-api --no-pager -n 80 || true
+          sudo journalctl -u firecrab-net-helper --no-pager -n 80 || true
