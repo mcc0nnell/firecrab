@@ -1,0 +1,123 @@
+name: M2Image real-build coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m2image-real-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan native real builds
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Derive aliases and architectures from manifest
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          manifest = "packaging/m2images.json"
+          command = ["python3", "scripts/m2image-manifest.py", "--manifest", manifest]
+
+          aliases = subprocess.check_output(command + ["aliases"], text=True).splitlines()
+          architectures = subprocess.check_output(
+              command + ["architectures"], text=True
+          ).splitlines()
+
+          runners = {
+              "x86_64": "ubuntu-24.04",
+              "aarch64": "ubuntu-24.04-arm",
+          }
+          unknown = sorted(set(architectures) - runners.keys())
+          if unknown:
+              raise SystemExit(f"no native GitHub runner mapping for: {', '.join(unknown)}")
+
+          include = [
+              {"alias": alias, "arch": arch, "runner": runners[arch]}
+              for alias in aliases
+              for arch in architectures
+          ]
+          if len(include) != len(aliases) * len(architectures):
+              raise SystemExit("incomplete M2Image build matrix")
+
+          matrix = json.dumps({"include": include}, separators=(",", ":"))
+          print(matrix)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"matrix={matrix}\n")
+          PY
+
+  real-build:
+    name: ${{ matrix.alias }} / ${{ matrix.arch }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify native architecture
+        run: |
+          set -euo pipefail
+          actual=$(uname -m)
+          test "$actual" = "${{ matrix.arch }}" || {
+            echo "runner architecture mismatch: expected ${{ matrix.arch }}, got $actual" >&2
+            exit 1
+          }
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            bzip2 \
+            curl \
+            dpkg-dev \
+            e2fsprogs \
+            file \
+            jq \
+            lz4 \
+            lzop \
+            xz-utils \
+            zstd
+
+      - name: Build and package real M2Image
+        run: |
+          sudo -n true
+          ./scripts/build-m2images.sh \
+            --alias "${{ matrix.alias }}" \
+            --arch "${{ matrix.arch }}"
+
+      - name: Materialize and package exact sources
+        env:
+          M2IMAGE_SOURCE_WORKERS: "4"
+        run: |
+          ./scripts/package-m2image-sources.sh \
+            --alias "${{ matrix.alias }}" \
+            --arch "${{ matrix.arch }}"
+
+      - name: Verify package checksums
+        run: |
+          cd "dist/m2images/${{ matrix.arch }}"
+          sha256sum -c SHA256SUMS
