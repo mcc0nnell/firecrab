@@ -1,6 +1,9 @@
 name: M2Image real-build coverage
 
 on:
+  push:
+    branches:
+      - ci/native-arm64-m2image-207
   workflow_dispatch:
   schedule:
     - cron: "23 5 * * 1"
