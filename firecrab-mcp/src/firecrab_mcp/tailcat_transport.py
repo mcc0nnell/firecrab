@@ -163,7 +163,9 @@ def _wait_for_address(
 
 def _pump(source: BinaryIO, destination: BinaryIO) -> None:
     try:
-        read = getattr(source, "read1", source.read)
+        read = getattr(source, "read1", None)
+        if read is None:
+            read = source.read
         while chunk := read(_COPY_CHUNK):
             destination.write(chunk)
             destination.flush()
