@@ -22,6 +22,7 @@ dev = [
 
 [project.scripts]
 firecrab-mcp = "firecrab_mcp.server:main"
+firecrab-mcp-tailcat = "firecrab_mcp.tailcat_transport:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/firecrab_mcp"]
