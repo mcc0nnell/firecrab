@@ -255,6 +255,11 @@ async fn injecting_a_guest_installs_an_init_the_stock_kernel_command_line_finds(
         "first boot should install a small package set: {boot}"
     );
     assert!(
+        boot.contains("openssh-server")
+            || boot.contains("apk add --no-cache") && boot.contains("openssh"),
+        "first boot should install openssh: {boot}"
+    );
+    assert!(
         boot.contains("/run/firecrab/$name.pid"),
         "each services.d entry must get its own pid file: {boot}"
     );
@@ -299,6 +304,13 @@ async fn injecting_a_guest_installs_an_init_the_stock_kernel_command_line_finds(
     }
     assert_eq!(guest_mode(&tree, "/tmp"), 0o1777);
     assert!(tree.join("etc/firecrab/services.d").is_dir());
+    let sshd = read_guest(&tree, crate::guest_ssh::GUEST_SSHD_SERVICE);
+    let sshd = String::from_utf8(sshd).expect("sshd service utf8");
+    assert!(sshd.contains("PermitRootLogin=prohibit-password"), "{sshd}");
+    assert_eq!(
+        guest_mode(&tree, crate::guest_ssh::GUEST_SSHD_SERVICE) & 0o111,
+        0o111
+    );
     // The image's own files are left exactly as they were.
     assert_eq!(read_guest(&tree, "/app/server"), b"binary");
 }
@@ -1095,5 +1107,51 @@ async fn a_provisioned_tree_records_the_program_it_will_boot() {
     assert_eq!(
         provisioned.toolbox_digest(),
         &Sha256Digest::of_bytes(&program)
+    );
+}
+
+/// `debugfs`-audited: apt-get and zypper images ship no `systemd-udevd`
+/// (issue #225), while dnf-based Rocky already carries it and apk-based
+/// Alpine isn't systemd at all. Pull `udev` in only where it's confirmed
+/// missing and a real, separate package.
+#[test]
+fn base_package_install_pulls_in_udev_where_systemd_ships_without_it() {
+    let script = provision::BASE_PACKAGE_INSTALL;
+
+    // Each branch's command may wrap onto a continuation line (apt-get's
+    // `\`), so join unindented and compare each `elif` block, not one line.
+    let joined = script.replace("\\\n", " ");
+    let block_with = |needle: &str| {
+        joined
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line contains {needle:?} in:\n{joined}"))
+    };
+
+    assert!(
+        block_with("apt-get install").contains("udev"),
+        "Debian/Ubuntu ship no systemd-udevd on a minimal OCI base — #225"
+    );
+    assert!(
+        block_with("zypper --non-interactive install").contains("udev"),
+        "openSUSE ships no systemd-udevd on a minimal OCI base — #225"
+    );
+
+    // Rocky/RHEL already carries systemd-udev; Alpine isn't systemd; Arch
+    // folds udev into the `systemd` package itself — adding a separate
+    // `udev` package there would 404 and break the whole install chain.
+    for needle in ["dnf install", "microdnf -y install", "yum install"] {
+        assert!(
+            !block_with(needle).contains("udev"),
+            "{needle} line must stay untouched — dnf-family already ships systemd-udev"
+        );
+    }
+    assert!(
+        !block_with("apk add").contains("udev"),
+        "Alpine is not systemd"
+    );
+    assert!(
+        !block_with("pacman -Sy").contains("udev"),
+        "Arch folds udev into the systemd package; a separate `udev` package does not exist"
     );
 }

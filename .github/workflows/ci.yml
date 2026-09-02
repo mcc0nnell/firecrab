@@ -213,7 +213,7 @@ jobs:
           AFTER=$(ls -la /var/lib/firecrab 2>&1 || true)
           test "$BEFORE" = "$AFTER" || { echo "--doctor mutated host state"; exit 1; }
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -463,7 +463,7 @@ jobs:
           ls -l /dev/kvm
           uname -a
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -530,6 +530,20 @@ jobs:
         run: |
           chmod +x scripts/ci-m2-guest-boot.sh
           scripts/ci-m2-guest-boot.sh "$BOOT_TEMPLATE"
+
+      - name: Install guest SSH E2E dependencies
+        if: matrix.host == 'ubuntu-24.04' && matrix.template == 'ubuntu-26.04'
+        run: |
+          npm ci --prefix firecrab-e2e
+          npm --prefix firecrab-e2e exec -- playwright install --with-deps chromium
+
+      - name: OCI guest SSH E2E (x86_64)
+        if: matrix.host == 'ubuntu-24.04' && matrix.template == 'ubuntu-26.04'
+        env:
+          # Reuse the firecrab-api service installed above; Playwright still
+          # starts its isolated Vite dashboard on :8080.
+          FIRECRAB_E2E_REUSE_SERVER: "1"
+        run: npm --prefix firecrab-e2e run test:dhcp
 
       - name: Console log and journals (on failure)
         if: failure()
@@ -605,7 +619,7 @@ jobs:
       - name: Install pinned toolchain
         run: rustup show
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -664,6 +678,19 @@ jobs:
         run: |
           chmod +x scripts/ci-m2-guest-boot.sh
           scripts/ci-m2-guest-boot.sh "$BOOT_TEMPLATE"
+
+      - name: Install guest SSH E2E dependencies
+        if: matrix.host == 'aarch64'
+        run: |
+          npm ci --prefix firecrab-e2e
+          npm --prefix firecrab-e2e exec -- playwright install --with-deps chromium
+
+      - name: OCI guest SSH E2E (aarch64)
+        if: matrix.host == 'aarch64'
+        env:
+          # Reuse the native arm64 API and net-helper services installed above.
+          FIRECRAB_E2E_REUSE_SERVER: "1"
+        run: npm --prefix firecrab-e2e run test:dhcp
 
       - name: Logs (on failure)
         if: failure()
