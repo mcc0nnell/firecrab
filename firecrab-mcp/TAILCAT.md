@@ -33,6 +33,8 @@ ordered byte stream. Reusing it directly means this path needs no:
 One launcher invocation creates one Tailcat server and one MCP stdio child.
 Tailcat pipe mode accepts one session. When that session ends, the launcher
 tears down the MCP child and the capability dies with the fresh server key.
+The launcher also enforces a bounded capability lifetime even if nobody ever
+connects.
 
 ## Tailcat version contract
 
@@ -76,12 +78,26 @@ The destination must not already exist. FireCrab creates it mode `0600` and
 removes it when the Tailcat/MCP session ends. A non-interactive launch without
 an address file is rejected rather than writing a bearer capability into logs.
 
+By default the capability is valid for at most ten minutes from publication,
+including time spent waiting for the first client. The allowed range is one
+minute to one hour:
+
+```bash
+firecrab-mcp-tailcat --session-ttl 300
+```
+
+When the TTL expires, the launcher terminates both Tailcat and the MCP child,
+removes the public address file if one was created, and exits with status 124.
+This makes an abandoned or leaked-but-unused token self-revoking at the process
+boundary instead of depending on an operator to remember cleanup.
+
 Equivalent environment variables are available:
 
 ```bash
 export FIRECRAB_MCP_TAILCAT_BIN=tailcat
 export FIRECRAB_MCP_TAILCAT_ADDRESS_FILE="$HOME/.local/run/firecrab/mcp.tailcat"
 export FIRECRAB_MCP_TAILCAT_STARTUP_TIMEOUT=15
+export FIRECRAB_MCP_TAILCAT_SESSION_TTL=600
 ```
 
 ## Connect from an MCP client
@@ -156,6 +172,7 @@ Treat the Tailcat connection token like a short-lived credential:
 - do not publish it in an issue or PR;
 - prefer `--address-file` for automation;
 - prefer `--allow-client` for trusted long-lived operator devices;
+- keep the TTL as short as the operation reasonably permits;
 - destroy the session when the work is complete.
 
 The launcher never places the token in the FireCrab MCP child environment or
