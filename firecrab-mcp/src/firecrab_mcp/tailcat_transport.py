@@ -7,6 +7,7 @@ creates one fresh Tailcat server identity and accepts one Tailcat session.
 The Tailcat connection token is a bearer capability. It is never passed to the
 MCP child, embedded in command arguments, or written to ordinary logs by this
 launcher. For automation, use --address-file; the token is written mode 0600.
+The capability also has a bounded lifetime even if no client ever connects.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ class TailcatConfig:
     address_file: Path | None = None
     allowed_client: str | None = None
     startup_timeout_seconds: float = 15.0
+    session_ttl_seconds: float = 10 * 60.0
 
 
 def _tailcat_command(config: TailcatConfig) -> list[str]:
@@ -230,6 +232,8 @@ def run(config: TailcatConfig) -> int:
     """Run one Tailcat capability-backed FireCrab MCP stdio session."""
     if config.startup_timeout_seconds <= 0:
         raise TailcatTransportError("Tailcat startup timeout must be greater than zero")
+    if not 60 <= config.session_ttl_seconds <= 3600:
+        raise TailcatTransportError("Tailcat session TTL must be between 60 and 3600 seconds")
 
     _check_tailcat_version(config.binary)
 
@@ -249,6 +253,7 @@ def run(config: TailcatConfig) -> int:
                 config.startup_timeout_seconds,
             )
             _publish_address(token, config.address_file)
+            expires_at = time.monotonic() + config.session_ttl_seconds
             try:
                 internal_address.unlink()
             except OSError:
@@ -278,6 +283,9 @@ def run(config: TailcatConfig) -> int:
                 thread.start()
 
             while True:
+                if time.monotonic() >= expires_at:
+                    return 124
+
                 tailcat_code = tailcat.poll()
                 mcp_code = mcp.poll()
 
@@ -355,6 +363,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=float(os.getenv("FIRECRAB_MCP_TAILCAT_STARTUP_TIMEOUT", "15")),
         help="seconds to wait for Tailcat to publish the capability",
     )
+    parser.add_argument(
+        "--session-ttl",
+        type=float,
+        default=float(os.getenv("FIRECRAB_MCP_TAILCAT_SESSION_TTL", "600")),
+        help="maximum capability lifetime in seconds (60-3600; default: 600)",
+    )
     return parser
 
 
@@ -365,6 +379,7 @@ def main() -> None:
         address_file=args.address_file,
         allowed_client=args.allow_client,
         startup_timeout_seconds=args.startup_timeout,
+        session_ttl_seconds=args.session_ttl,
     )
     try:
         raise SystemExit(run(config))
