@@ -5,9 +5,7 @@ on:
     branches: [main]
   pull_request:
   # The VM-boot job below is too slow for every PR but is the only thing that
-  # proves a guest actually comes up, so it runs nightly and on demand.
-  schedule:
-    - cron: "0 17 * * *"
+  # proves a guest actually comes up, so it runs on demand.
   workflow_dispatch:
 
 concurrency:
